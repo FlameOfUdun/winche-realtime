@@ -57,7 +57,8 @@ public sealed record RealtimeSweep(int Closed, int Archived, int Deleted, int Fa
 /// are closed (their followers told), and lists closed for <see cref="WincheRealtimeOptions.RetainClosedFor"/> are
 /// archived (when there's an archive) and deleted. A list the archive can't take stays for the next sweep.
 /// </summary>
-public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions options, RealtimeNotifier notifier, ILogger? log = null)
+public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions options, RealtimeNotifier notifier, ILogger? log = null,
+    RealtimePresence? presence = null)
 {
     private readonly ILogger _log = log ?? NullLogger.Instance;
     private const int Batch = 200;
@@ -105,6 +106,9 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
             deleted++;
             _log.LogInformation("Realtime deleted {Path} ({Count} items), closed {Days:0} days ago.", list.Path, list.Count, (now - list.ClosedAt!.Value).TotalDays);
         }
+        // Servers that stopped checking in (crashed): their members go, their on-disconnect items appended.
+        if (presence is not null && await presence.SweepDeadServersAsync(now - options.PresenceTimeout, token) is > 0 and var dropped)
+            _log.LogInformation("Realtime removed {Count} members of servers that stopped checking in.", dropped);
         return new RealtimeSweep(closed, archived, deleted, failed);
     }
 }

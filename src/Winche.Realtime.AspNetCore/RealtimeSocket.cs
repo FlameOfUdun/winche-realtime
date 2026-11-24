@@ -55,6 +55,7 @@ public static class RealtimeSocketExtensions
         var caller = await http.WincheCallerOf();
         using var socket = await http.WebSockets.AcceptWebSocketAsync();
         var connection = new RealtimeConnection(socket, caller, http.RequestServices.GetRequiredService<RealtimeLists>(),
+            http.RequestServices.GetRequiredService<RealtimeChannels>(), http.RequestServices.GetRequiredService<RealtimePresence>(),
             http.RequestServices.GetService<RealtimeSocketOptions>() ?? new RealtimeSocketOptions(),
             http.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("Winche.Realtime.Socket"));
         await connection.RunAsync(http.RequestAborted);
@@ -63,14 +64,15 @@ public static class RealtimeSocketExtensions
 
 /// <summary>One client's connection: its requests, its subscriptions, one writer for what goes out.</summary>
 internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<string, object?>? caller, RealtimeLists lists,
-    RealtimeSocketOptions options, ILogger log)
+    RealtimeChannels channels, RealtimePresence presence, RealtimeSocketOptions options, ILogger log)
 {
     private readonly Channel<string> _out = Channel.CreateBounded<string>(new BoundedChannelOptions(options.SendQueueLimit) { SingleReader = true });
-    private readonly Dictionary<string, Subscription> _subscriptions = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, IDisposable> _subscriptions = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _closing = new();
     private readonly string _id = Guid.NewGuid().ToString("N");
     internal RealtimeLists Lists => lists;
     internal RealtimeSocketOptions Options => options;
+    internal RealtimePresence Presence => presence;
     internal ILogger Log => log;
 
     public async Task RunAsync(CancellationToken aborted)
@@ -92,6 +94,9 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         finally
         {
             lock (_subscriptions) { foreach (var s in _subscriptions.Values) s.Dispose(); _subscriptions.Clear(); }
+            // Gone without leaving: out of every presence set, its on-disconnect items appended.
+            try { await presence.DisconnectedAsync(_id, CancellationToken.None); }
+            catch (Exception e) { log.LogWarning(e, "Realtime couldn't end connection {Connection}'s presence: the sweep will.", _id); }
             _out.Writer.TryComplete();
             try { await writing; } catch { /* gone */ }
             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
@@ -151,10 +156,15 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
                 "read" => await ReadAsync(frame, ct),
                 "subscribe" => await SubscribeAsync(frame, id, ct),
                 "unsubscribe" => Unsubscribe(frame),
+                "publish" => await PublishAsync(frame, ct),
+                "listen" => await ListenAsync(frame, id, ct),
+                "join" => await JoinAsync(frame, ct),
+                "leave" => await LeaveAsync(frame, ct),
+                "watch" => await WatchAsync(frame, id, ct),
                 "open" => new JsonObject { ["list"] = List(await lists.OpenAsync(caller, Path(frame), ct)) },
                 "close" => new JsonObject { ["list"] = List(await lists.CloseAsync(caller, Path(frame), ct)) },
                 var other => throw new RealtimeException(WincheErrorCode.InvalidArgument,
-                    $"'{other}' isn't a request: ping, append, read, subscribe, unsubscribe, open or close."),
+                    $"'{other}' isn't a request: ping, append, read, subscribe, unsubscribe, open, close, publish, listen, join, leave or watch."),
             };
             await SendAsync(new JsonObject { ["type"] = "response", ["id"] = id, ["result"] = result }, ct);
         }
@@ -201,6 +211,134 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
             _subscriptions[name] = new Subscription(this, name, path, After(frame), list?.State, ct);
         }
         return new JsonObject { ["subscription"] = name, ["list"] = list is null ? null : List(list) };
+    }
+
+    private void Hold(string name, IDisposable subscription)
+    {
+        lock (_subscriptions)
+        {
+            if (_subscriptions.Count >= options.MaxSubscriptions)
+            {
+                subscription.Dispose();
+                throw new RealtimeException(WincheErrorCode.ResourceExhausted, $"A connection holds at most {options.MaxSubscriptions} subscriptions.");
+            }
+            if (!_subscriptions.TryAdd(name, subscription))
+            {
+                subscription.Dispose();
+                throw new RealtimeException(WincheErrorCode.AlreadyExists, $"There's a subscription {name} already.");
+            }
+        }
+    }
+
+    // ── channels ────────────────────────────────────────────────────────────────
+
+    private async Task<JsonObject> PublishAsync(JsonObject frame, CancellationToken ct)
+    {
+        await channels.PublishAsync(caller, Path(frame), ChannelOf(frame), Payload(frame), ct);
+        return new JsonObject();
+    }
+
+    /// <summary>
+    /// Listens on a channel: each message, as it comes, as a <c>message</c> frame. Live only: a connection too slow to
+    /// take them misses some (channels keep nothing to catch up from).
+    /// </summary>
+    private async Task<JsonObject> ListenAsync(JsonObject frame, string? id, CancellationToken ct)
+    {
+        var path = Path(frame);
+        var channel = ChannelOf(frame);
+        await channels.CanListenAsync(caller, path, channel, ct);
+        var name = id ?? Guid.NewGuid().ToString("N");
+        Hold(name, channels.Listen(path, channel, m => _out.Writer.TryWrite(new JsonObject
+        {
+            ["type"] = "message", ["subscription"] = name, ["path"] = m.Path, ["channel"] = m.Channel, ["by"] = m.By,
+            ["at"] = m.At.ToString("O"), ["payload"] = Convert.ToBase64String(m.Payload),
+        }.ToJsonString())));
+        return new JsonObject { ["subscription"] = name };
+    }
+
+    // ── presence ────────────────────────────────────────────────────────────────
+
+    private async Task<JsonObject> JoinAsync(JsonObject frame, CancellationToken ct)
+    {
+        RealtimeItemIn? onDisconnect = null;
+        if (frame["onDisconnect"] is JsonObject od)
+        {
+            var key = od["key"]?.GetValueKind() == JsonValueKind.String ? (string)od["key"]! : "";
+            onDisconnect = new RealtimeItemIn(key, Payload(od));
+            if (key.Length == 0) throw new RealtimeException(WincheErrorCode.InvalidArgument, "onDisconnect needs a key and a payload (base64).");
+        }
+        await presence.JoinAsync(caller, _id, Path(frame), frame["data"] as JsonObject, onDisconnect, ct);
+        return new JsonObject();
+    }
+
+    private async Task<JsonObject> LeaveAsync(JsonObject frame, CancellationToken ct)
+    {
+        await presence.LeaveAsync(_id, Path(frame), ct);
+        return new JsonObject();
+    }
+
+    /// <summary>Watches who's at a path: the members now (the answer), then a <c>presence</c> frame with them each time they change.</summary>
+    private async Task<JsonObject> WatchAsync(JsonObject frame, string? id, CancellationToken ct)
+    {
+        var path = Path(frame);
+        await presence.CanWatchAsync(caller, path, ct);
+        var name = id ?? Guid.NewGuid().ToString("N");
+        var members = await presence.MembersAsync(path, ct);
+        Hold(name, new Watch(this, name, path, Members(members), ct));
+        return new JsonObject { ["subscription"] = name, ["members"] = Members(members) };
+    }
+
+    /// <summary>A presence watch: each change re-reads the members (every server's) and sends them if they differ.</summary>
+    private sealed class Watch : IDisposable
+    {
+        private readonly CancellationTokenSource _stop;
+        private readonly SemaphoreSlim _changed = new(0, 1);
+        private readonly IDisposable _watch;
+
+        public Watch(RealtimeConnection connection, string name, string path, JsonArray sent, CancellationToken ct)
+        {
+            _stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _watch = connection.Lists.Notifier.Watch(RealtimePresence.Key(path), _ => { if (_changed.CurrentCount == 0) try { _changed.Release(); } catch (SemaphoreFullException) { } });
+            _ = RunAsync(connection, name, path, sent.ToJsonString(), _stop.Token);
+        }
+
+        private async Task RunAsync(RealtimeConnection connection, string name, string path, string last, CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    await _changed.WaitAsync(ct);
+                    var members = Members(await connection.Presence.MembersAsync(path, ct));
+                    if (members.ToJsonString() == last) continue;
+                    last = members.ToJsonString();
+                    await connection.SendAsync(new JsonObject { ["type"] = "presence", ["subscription"] = name, ["path"] = path, ["members"] = members }, ct);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception e) { connection.Log.LogWarning(e, "Realtime presence watch of {Path} stopped.", path); }
+        }
+
+        public void Dispose()
+        {
+            _watch.Dispose();
+            _stop.Cancel();
+            _stop.Dispose();
+        }
+    }
+
+    private static JsonArray Members(IEnumerable<RealtimeMember> members) => new(members.Select(m => (JsonNode)new JsonObject
+    {
+        ["uid"] = m.Uid, ["data"] = m.Data?.DeepClone(), ["joinedAt"] = m.JoinedAt.ToString("O"),
+    }).ToArray());
+
+    private static string ChannelOf(JsonObject frame) =>
+        frame["channel"]?.GetValueKind() == JsonValueKind.String ? (string)frame["channel"]! : throw new RealtimeException(WincheErrorCode.InvalidArgument, "Give the channel's name.");
+
+    private static byte[] Payload(JsonObject frame)
+    {
+        try { return Convert.FromBase64String(frame["payload"]?.GetValueKind() == JsonValueKind.String ? (string)frame["payload"]! : ""); }
+        catch (FormatException) { throw new RealtimeException(WincheErrorCode.InvalidArgument, "payload is base64."); }
     }
 
     private JsonObject Unsubscribe(JsonObject frame)

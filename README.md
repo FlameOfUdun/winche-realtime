@@ -13,7 +13,11 @@ during a session (thousands of small items, needed live and after a reconnect) r
 - **Lifecycle:** idle lists close by themselves; closed lists are kept a while, then archived (if you give it an
   archive) and deleted.
 
-Channels (live messages, never stored), presence and the console come in later releases.
+- **Channels:** live messages at a path (telemetry a screen draws), to everyone listening on every server, never kept.
+- **Presence:** who's connected at a path, the same on every server, and an item appended to the path's list when a
+  connection drops without leaving.
+
+Functions, the console and Winche Server come in later releases.
 
 ## Packages
 
@@ -59,6 +63,11 @@ base64. The server says `welcome { connectionId }` first.
 | `unsubscribe { subscription }` | `{}` |
 | `read { path, after?, limit? }` | `{ items, list }`: a page (up to 1000). |
 | `open { path }` / `close { path }` | `{ list }`. A closed list takes no more items and still reads. |
+| `publish { path, channel, payload }` | `{}`: to everyone listening now, on every server. Never kept. |
+| `listen { path, channel }` | `{ subscription }`, then `message { subscription, path, channel, by, at, payload }` frames. Live only: a connection too slow to take them misses some. |
+| `join { path, data?, onDisconnect?: { key, payload } }` | `{}`: in the path's presence, saying `data` (JSON, up to 1 KB) of yourself. |
+| `leave { path }` | `{}`: out, and nothing appended. |
+| `watch { path }` | `{ subscription, members }`, then `presence { subscription, path, members }` each time they change. A member is `{ uid, data, joinedAt }`. |
 | `ping` | `{}` |
 
 Items are `{ key, position, at, by, payload }`. A list is `{ path, state, count, bytes, openedAt, closedAt }`.
@@ -68,7 +77,10 @@ the last position you got. Nothing is lost.
 
 ## Rules
 
-Per path, default deny, with the shared operations:
+Per path, default deny, with the shared operations. Lists are ruled at their path; channels at
+`channels/{path}/{channel}` (`create` to publish, with `request.resource.bytes`; `get` to listen); presence at
+`presence/{path}` (`create` to join, `get` to watch). An on-disconnect item is checked against the list's `create` rule
+when joining, so a drop never appends what the member couldn't have.
 
 | Operation | Covers |
 | --- | --- |
@@ -86,6 +98,12 @@ device from appending as another. Rules never see payloads.
 Every append, open and close announces itself on Postgres (`NOTIFY winche_realtime`, sent when it commits); each
 server listens and wakes its followers, who read what's new from the database. A follower woken twice, or late,
 never repeats or skips an item. Nothing to set up beyond the shared database.
+
+## Presence across servers
+
+Members are kept in `winche_realtime_presence`, with each server checking in every 10 seconds
+(`PresenceBeatEvery`). A connection that ends leaves everywhere at once; a server that stops checking in for 30 seconds
+(`PresenceTimeout`, a crash) has its members removed by the sweep, their on-disconnect items appended as them.
 
 ## Lifecycle
 

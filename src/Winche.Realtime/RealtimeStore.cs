@@ -41,6 +41,26 @@ public sealed class RealtimeStore : IAsyncDisposable
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_{Items}_path_position ON {Items} (path, position);
         """,
+        // Presence: who's connected where, and the servers they're on (each checks in).
+        $"""
+        CREATE TABLE IF NOT EXISTS {RealtimePresence.Servers} (
+            id text PRIMARY KEY,
+            seen_at timestamptz NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS {RealtimePresence.Members} (
+            connection_id text NOT NULL,
+            path text NOT NULL,
+            uid text,
+            data jsonb,
+            on_disconnect_key text,
+            on_disconnect_payload bytea,
+            server_id text NOT NULL,
+            joined_at timestamptz NOT NULL,
+            PRIMARY KEY (connection_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_{RealtimePresence.Members}_path ON {RealtimePresence.Members} (path);
+        CREATE INDEX IF NOT EXISTS idx_{RealtimePresence.Members}_server ON {RealtimePresence.Members} (server_id);
+        """,
     ];
 
     private readonly WincheRealtimeOptions _options;

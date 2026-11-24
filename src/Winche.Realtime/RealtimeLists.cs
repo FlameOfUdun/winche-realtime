@@ -30,16 +30,7 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
     {
         RealtimeStore.CheckPath(path);
         var list = await Store.InfoAsync(path, ct);
-        var batch = new Dictionary<string, object?>
-        {
-            ["count"] = (long)items.Count,
-            ["bytes"] = items.Sum(i => (long)(i.Payload?.Length ?? 0)),
-            ["keys"] = items.Select(i => (object?)i.Key).ToList(),
-        };
-        var devices = items.Select(i => i.Key is { } k && k.IndexOf(':') is var at and > 0 ? k[..at] : i.Key).Distinct().ToList();
-        batch["devices"] = devices.Select(d => (object?)d).ToList();
-        batch["device"] = devices.Count == 1 ? devices[0] : null;   // one device's batch, or null when mixed
-        await RequireAsync(RuleOperation.Create, "append to", path, caller, list, batch, ct);
+        await RequireAsync(RuleOperation.Create, "append to", path, caller, list, Batch(items), ct);
         var positions = await Store.AppendAsync(path, items, WincheCaller.UidOf(caller), ct);
         Notifier.Changed(path, positions.Max());
         return positions;
@@ -81,13 +72,41 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
         return list;
     }
 
-    private async Task RequireAsync(RuleOperation operation, string verb, string path, IReadOnlyDictionary<string, object?>? caller,
-        RealtimeListInfo? list, IReadOnlyDictionary<string, object?>? incoming, CancellationToken ct)
+    /// <summary>Whether the caller may append <paramref name="items"/> to <paramref name="path"/>: refused if not (nothing appended).</summary>
+    internal async Task CanAppendAsync(IReadOnlyDictionary<string, object?>? caller, string path, IReadOnlyList<RealtimeItemIn> items, CancellationToken ct)
     {
-        var resource = list is null ? (Value)RuleValues.Null : Value.FromObject(new Dictionary<string, object?>
+        RealtimeStore.CheckPath(path);
+        await RequireAsync(RuleOperation.Create, "append to", path, caller, await Store.InfoAsync(path, ct), Batch(items), ct);
+    }
+
+    private static Dictionary<string, object?> Batch(IReadOnlyList<RealtimeItemIn> items)
+    {
+        var devices = items.Select(i => i.Key is { } k && k.IndexOf(':') is var at and > 0 ? k[..at] : i.Key).Distinct().ToList();
+        return new Dictionary<string, object?>
+        {
+            ["count"] = (long)items.Count,
+            ["bytes"] = items.Sum(i => (long)(i.Payload?.Length ?? 0)),
+            ["keys"] = items.Select(i => (object?)i.Key).ToList(),
+            ["devices"] = devices.Select(d => (object?)d).ToList(),
+            ["device"] = devices.Count == 1 ? devices[0] : null,   // one device's batch, or null when mixed
+        };
+    }
+
+    /// <summary>The rules' word on <paramref name="operation"/> at <paramref name="rulePath"/> (channels and presence use their own paths).</summary>
+    internal Task RequireAsync(RuleOperation operation, string verb, string rulePath, IReadOnlyDictionary<string, object?>? caller,
+        IReadOnlyDictionary<string, object?>? resource, IReadOnlyDictionary<string, object?>? incoming, CancellationToken ct) =>
+        CheckAsync(operation, verb, rulePath, caller, resource is null ? RuleValues.Null : Value.FromObject(resource), incoming, ct);
+
+    private Task RequireAsync(RuleOperation operation, string verb, string path, IReadOnlyDictionary<string, object?>? caller,
+        RealtimeListInfo? list, IReadOnlyDictionary<string, object?>? incoming, CancellationToken ct) =>
+        CheckAsync(operation, verb, path, caller, list is null ? RuleValues.Null : Value.FromObject(new Dictionary<string, object?>
         {
             ["state"] = list.State, ["count"] = list.Count, ["bytes"] = list.Bytes,
-        });
+        }), incoming, ct);
+
+    private async Task CheckAsync(RuleOperation operation, string verb, string path, IReadOnlyDictionary<string, object?>? caller,
+        Value resource, IReadOnlyDictionary<string, object?>? incoming, CancellationToken ct)
+    {
         var request = new RuleRequest
         {
             Resource = resource,

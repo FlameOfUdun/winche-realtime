@@ -18,6 +18,12 @@ builder.Services.AddWincheRealtime(o =>
           allow create: if request.auth != null && request.resource.device == request.auth.uid;
           allow update: if request.auth != null;
         }
+        match channels/sessions/{session}/{channel} {
+          allow get, create: if request.auth != null;
+        }
+        match presence/sessions/{session} {
+          allow get, create: if request.auth != null;
+        }
         """);
 });
 builder.Services.AddWincheRealtimeWsApi();

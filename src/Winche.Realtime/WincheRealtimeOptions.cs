@@ -33,6 +33,18 @@ public sealed class WincheRealtimeOptions
     /// <summary>How often the sweep runs (one server at a time). Default a minute.</summary>
     public TimeSpan SweepEvery { get; set; } = TimeSpan.FromMinutes(1);
 
+    /// <summary>The largest message on a channel, in bytes. Default 4 KB (messages cross servers through Postgres).</summary>
+    public int MaxMessageBytes { get; set; } = 4 * 1024;
+
+    /// <summary>The most JSON a member may say of themselves when they join. Default 1 KB.</summary>
+    public int MaxPresenceDataBytes { get; set; } = 1024;
+
+    /// <summary>How often each server checks in, so others keep its members. Default 10 seconds.</summary>
+    public TimeSpan PresenceBeatEvery { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>A server silent this long is gone: the sweep removes its members (running their on-disconnect). Default 30 seconds.</summary>
+    public TimeSpan PresenceTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
     /// <summary>The clock (tests move it).</summary>
     public TimeProvider Time { get; set; } = TimeProvider.System;
 

@@ -9,7 +9,7 @@ namespace Winche.Realtime;
 /// open or close commits on any server) and tells this server's followers. A follower reads from the store, so a change
 /// heard twice (here, and from this server's own notifier) or late only wakes it; it never repeats or skips an item.
 /// </summary>
-internal sealed class RealtimeRelay(RealtimeStore store, RealtimeNotifier notifier, ILogger<RealtimeRelay> log) : BackgroundService
+internal sealed class RealtimeRelay(RealtimeStore store, RealtimeNotifier notifier, RealtimeChannels channels, ILogger<RealtimeRelay> log) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -20,8 +20,12 @@ internal sealed class RealtimeRelay(RealtimeStore store, RealtimeNotifier notifi
             {
                 await store.EnsureAsync(stoppingToken);
                 await using var conn = await store.DataSource.OpenConnectionAsync(stoppingToken);
-                conn.Notification += (_, e) => Heard(e.Payload);
-                await using (var listen = new NpgsqlCommand($"LISTEN {RealtimeStore.Channel}", conn))
+                conn.Notification += (_, e) =>
+                {
+                    try { if (e.Channel == RealtimeChannels.Channel) channels.Heard(e.Payload); else Heard(e.Payload); }
+                    catch (Exception x) { log.LogWarning(x, "Realtime's relay couldn't read a notification."); }
+                };
+                await using (var listen = new NpgsqlCommand($"LISTEN {RealtimeStore.Channel}; LISTEN {RealtimeChannels.Channel}", conn))
                     await listen.ExecuteNonQueryAsync(stoppingToken);
                 wait = TimeSpan.FromMilliseconds(250);
                 while (!stoppingToken.IsCancellationRequested) await conn.WaitAsync(stoppingToken);

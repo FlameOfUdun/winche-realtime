@@ -25,10 +25,15 @@ public static class ServiceCollectionExtensions
         services.AddWincheRules(RulesKey, o => o.WithMutableRuleSetRepository(RuleSet.Merge(options.Rulesets)));
         services.AddSingleton(sp => new RealtimeLists(sp.GetRequiredService<RealtimeStore>(), sp.GetRequiredKeyedService<RuleEngine>(RulesKey),
             sp.GetRequiredService<RealtimeNotifier>()));
+        services.AddSingleton<RealtimeNode>();
+        services.AddSingleton(sp => new RealtimeChannels(sp.GetRequiredService<RealtimeLists>(), sp.GetRequiredService<RealtimeNode>(), options));
+        services.AddSingleton(sp => new RealtimePresence(sp.GetRequiredService<RealtimeLists>(), sp.GetRequiredService<RealtimeNode>(), options,
+            sp.GetService<Microsoft.Extensions.Logging.ILoggerFactory>()?.CreateLogger("Winche.Realtime.Presence")));
         services.AddSingleton(sp => new RealtimeSweeper(sp.GetRequiredService<RealtimeStore>(), options, sp.GetRequiredService<RealtimeNotifier>(),
-            sp.GetService<Microsoft.Extensions.Logging.ILoggerFactory>()?.CreateLogger("Winche.Realtime.Sweep")));
-        // Several servers share lists through Postgres; one sweeps at a time.
+            sp.GetService<Microsoft.Extensions.Logging.ILoggerFactory>()?.CreateLogger("Winche.Realtime.Sweep"), sp.GetRequiredService<RealtimePresence>()));
+        // Several servers share lists, messages and presence through Postgres; each checks in; one sweeps at a time.
         services.AddHostedService<RealtimeRelay>();
+        services.AddHostedService<RealtimeHeartbeat>();
         services.AddHostedService<RealtimeSweepService>();
         return services;
     }
