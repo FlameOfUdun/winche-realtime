@@ -241,6 +241,34 @@ public sealed class RealtimeStore : IAsyncDisposable
         return list;
     }
 
+    /// <summary>Lists in path order, after <paramref name="afterPath"/>: those under <paramref name="prefix"/>, in <paramref name="state"/> (open, closed).</summary>
+    public async Task<IReadOnlyList<RealtimeListInfo>> ListsAsync(string? prefix, string? state, string? afterPath, int limit, CancellationToken ct = default)
+    {
+        await EnsureAsync(ct);
+        var lists = new List<RealtimeListInfo>();
+        await using var cmd = _db.CreateCommand($"""
+            SELECT path, state, count, bytes, opened_at, closed_at FROM {Lists}
+            WHERE ($1::text IS NULL OR left(path, length($1)) = $1) AND ($2::text IS NULL OR state = $2) AND ($3::text IS NULL OR path > $3)
+            ORDER BY path LIMIT $4
+            """);
+        cmd.Parameters.Add(new() { Value = (object?)(string.IsNullOrEmpty(prefix) ? null : prefix) ?? DBNull.Value, NpgsqlDbType = NpgsqlDbType.Text });
+        cmd.Parameters.Add(new() { Value = (object?)state ?? DBNull.Value, NpgsqlDbType = NpgsqlDbType.Text });
+        cmd.Parameters.Add(new() { Value = (object?)afterPath ?? DBNull.Value, NpgsqlDbType = NpgsqlDbType.Text });
+        cmd.Parameters.Add(new() { Value = Math.Clamp(limit, 1, 500) });
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct)) lists.Add(Info(r));
+        return lists;
+    }
+
+    /// <summary>Deletes a closed list and its items now (the console's "delete"): false when it's open or not there.</summary>
+    public async Task<bool> DeleteClosedAsync(string path, CancellationToken ct = default)
+    {
+        CheckPath(path);
+        if ((await InfoAsync(path, ct))?.State != "closed") return false;
+        await DeleteAsync(path, ct);
+        return true;
+    }
+
     // ── the sweep's ─────────────────────────────────────────────────────────────
 
     /// <summary>Closes open lists with no item (nor opening) since <paramref name="before"/>: the lists closed.</summary>

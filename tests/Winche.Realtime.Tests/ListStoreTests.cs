@@ -116,4 +116,18 @@ public class ListStoreTests(PostgresFixture pg)
         var store = await Store();
         Assert.Equal(WincheErrorCode.InvalidArgument, (await Assert.ThrowsAsync<RealtimeException>(() => store.AppendAsync(path, [Item("k", "a")], "a"))).Code);
     }
+
+    [Fact]
+    public async Task Lists_page_by_path_with_a_prefix_and_state_and_a_closed_one_deletes()
+    {
+        var store = await Store();
+        foreach (var p in new[] { "sessions/a", "sessions/b", "sessions/c", "other/x" }) await store.AppendAsync(p, [Item("k", "v")], null);
+        await store.CloseAsync("sessions/b");
+        Assert.Equal(["sessions/a", "sessions/b"], (await store.ListsAsync("sessions/", null, null, 2)).Select(l => l.Path));
+        Assert.Equal(["sessions/c"], (await store.ListsAsync("sessions/", null, "sessions/b", 2)).Select(l => l.Path));
+        Assert.Equal(["sessions/b"], (await store.ListsAsync(null, "closed", null, 10)).Select(l => l.Path));
+        Assert.False(await store.DeleteClosedAsync("sessions/a"));   // open: not deleted
+        Assert.True(await store.DeleteClosedAsync("sessions/b"));
+        Assert.Null(await store.InfoAsync("sessions/b"));
+    }
 }
