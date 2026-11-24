@@ -34,6 +34,20 @@ public sealed class RealtimeChannels(RealtimeLists lists, RealtimeNode node, Win
             throw new RealtimeException(WincheErrorCode.InvalidArgument, $"A message is at most {options.MaxMessageBytes} bytes (they cross servers through Postgres).");
         await lists.RequireAsync(RuleOperation.Create, "publish on", RulePath(path, channel), caller, null,
             new Dictionary<string, object?> { ["bytes"] = (long)payload.Length }, ct);
+        await SendAsync(caller, path, channel, payload, ct);
+    }
+
+    /// <summary>Publishes with the server's rights (functions, the admin SDK from a server): no rules.</summary>
+    public async Task ServerPublishAsync(string path, string channel, byte[] payload, CancellationToken ct = default)
+    {
+        Check(path, channel);
+        if (payload.Length > options.MaxMessageBytes)
+            throw new RealtimeException(WincheErrorCode.InvalidArgument, $"A message is at most {options.MaxMessageBytes} bytes (they cross servers through Postgres).");
+        await SendAsync(null, path, channel, payload, ct);
+    }
+
+    private async Task SendAsync(IReadOnlyDictionary<string, object?>? caller, string path, string channel, byte[] payload, CancellationToken ct)
+    {
         var message = new RealtimeMessage(path, channel, payload, WincheCaller.UidOf(caller), options.Time.GetUtcNow());
         Deliver(message);
         var wire = new JsonObject

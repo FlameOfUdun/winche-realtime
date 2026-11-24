@@ -62,6 +62,34 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
         return list;
     }
 
+    /// <summary>
+    /// With the server's rights (functions, the admin SDK from a server): no rules. Followers are told and changes
+    /// published as for anyone else's.
+    /// </summary>
+    public async Task<IReadOnlyList<long>> ServerAppendAsync(string path, IReadOnlyList<RealtimeItemIn> items, CancellationToken ct = default)
+    {
+        var positions = await Store.AppendAsync(path, items, null, ct);
+        Notifier.Changed(path, positions.Max());
+        return positions;
+    }
+
+    /// <inheritdoc cref="ServerAppendAsync"/>
+    public async Task<RealtimeListInfo> ServerOpenAsync(string path, CancellationToken ct = default)
+    {
+        var list = await Store.OpenAsync(path, ct);
+        Notifier.Changed(path, list.Count);
+        return list;
+    }
+
+    /// <inheritdoc cref="ServerAppendAsync"/>
+    public async Task<RealtimeListInfo> ServerCloseAsync(string path, CancellationToken ct = default)
+    {
+        var list = await Store.CloseAsync(path, ct);
+        Notifier.Changed(path, list.Count);
+        if (changes is not null) await changes.ClosedAsync(list, ct);
+        return list;
+    }
+
     /// <summary>Closes a list, if the rules allow <c>update</c>.</summary>
     public async Task<RealtimeListInfo> CloseAsync(IReadOnlyDictionary<string, object?>? caller, string path, CancellationToken ct = default)
     {
