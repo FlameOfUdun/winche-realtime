@@ -9,8 +9,11 @@ during a session (thousands of small items, needed live and after a reconnect) r
 - **Catch up from where you were:** subscribe from a position and get everything after it, then new items as they come.
 - **Payloads are yours:** bytes the server never reads (JSON, a binary encoding, compressed batches).
 - **Rules and limits:** who may do what, per path (default deny); limits per item, batch and list.
+- **Several servers:** they share lists through Postgres; an append or close on one reaches followers on all.
+- **Lifecycle:** idle lists close by themselves; closed lists are kept a while, then archived (if you give it an
+  archive) and deleted.
 
-Channels (live messages, never stored), presence, several servers and the console come in later releases.
+Channels (live messages, never stored), presence and the console come in later releases.
 
 ## Packages
 
@@ -77,6 +80,25 @@ Per path, default deny, with the shared operations:
 `request.resource` is the batch: `count`, `bytes`, `keys`, `devices` (each key's part before its first `:`) and
 `device` (the one device all its keys belong to, or null), so `request.resource.device == request.auth.uid` keeps one
 device from appending as another. Rules never see payloads.
+
+## Several servers
+
+Every append, open and close announces itself on Postgres (`NOTIFY winche_realtime`, sent when it commits); each
+server listens and wakes its followers, who read what's new from the database. A follower woken twice, or late,
+never repeats or skips an item. Nothing to set up beyond the shared database.
+
+## Lifecycle
+
+| Setting | Default | What |
+| --- | --- | --- |
+| `IdleCloseAfter` | 24 hours | An open list with no new item for this long is closed (null: never). |
+| `RetainClosedFor` | 30 days | A closed list is kept (it still reads), then archived and deleted. |
+| `SweepEvery` | 1 minute | How often the sweep runs: one server at a time (a Postgres advisory lock). |
+
+`UseArchive(IRealtimeArchive)` gives the sweep somewhere to put each list before it's deleted: one gzipped NDJSON
+file (an item a line, in order: `key`, `position`, `at`, `by`, `payload` in base64), named
+`RealtimeArchives.FileName(path)` (`{path}/archive.ndjson.gz`) if you want a name. A list the archive can't take stays
+for the next sweep; nothing is deleted unarchived. Without an archive, lists are simply deleted.
 
 ## Limits
 

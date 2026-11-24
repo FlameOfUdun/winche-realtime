@@ -24,6 +24,28 @@ public sealed class WincheRealtimeOptions
     /// <summary>The longest key, in characters. Default 200.</summary>
     public int MaxKeyLength { get; set; } = 200;
 
+    /// <summary>A list with no new item for this long is closed by the sweep. Null: never. Default 24 hours.</summary>
+    public TimeSpan? IdleCloseAfter { get; set; } = TimeSpan.FromHours(24);
+
+    /// <summary>How long a closed list is kept (it still reads) before it's archived, if asked, and deleted. Default 30 days.</summary>
+    public TimeSpan RetainClosedFor { get; set; } = TimeSpan.FromDays(30);
+
+    /// <summary>How often the sweep runs (one server at a time). Default a minute.</summary>
+    public TimeSpan SweepEvery { get; set; } = TimeSpan.FromMinutes(1);
+
+    /// <summary>The clock (tests move it).</summary>
+    public TimeProvider Time { get; set; } = TimeProvider.System;
+
+    /// <summary>Where closed lists go before they're deleted, if anywhere.</summary>
+    public IRealtimeArchive? Archive { get; private set; }
+
+    /// <summary>Archives each closed list (one gzipped NDJSON file) before it's deleted.</summary>
+    public WincheRealtimeOptions UseArchive(IRealtimeArchive archive)
+    {
+        Archive = archive ?? throw new ArgumentNullException(nameof(archive));
+        return this;
+    }
+
     internal List<RuleSet> Rulesets { get; } = [];
 
     /// <summary>Adds rules (OR-combined with others). Without any, everything is refused.</summary>

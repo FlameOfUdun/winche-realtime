@@ -25,6 +25,11 @@ public static class ServiceCollectionExtensions
         services.AddWincheRules(RulesKey, o => o.WithMutableRuleSetRepository(RuleSet.Merge(options.Rulesets)));
         services.AddSingleton(sp => new RealtimeLists(sp.GetRequiredService<RealtimeStore>(), sp.GetRequiredKeyedService<RuleEngine>(RulesKey),
             sp.GetRequiredService<RealtimeNotifier>()));
+        services.AddSingleton(sp => new RealtimeSweeper(sp.GetRequiredService<RealtimeStore>(), options, sp.GetRequiredService<RealtimeNotifier>(),
+            sp.GetService<Microsoft.Extensions.Logging.ILoggerFactory>()?.CreateLogger("Winche.Realtime.Sweep")));
+        // Several servers share lists through Postgres; one sweeps at a time.
+        services.AddHostedService<RealtimeRelay>();
+        services.AddHostedService<RealtimeSweepService>();
         return services;
     }
 }

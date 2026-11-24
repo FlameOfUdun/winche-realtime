@@ -24,9 +24,9 @@ public class SocketTests(PostgresFixture pg)
         """;
 
     /// <summary>A host with Realtime at /realtime/v1/ws; ?access_token=uid[,host][,exp=unix] signs in (none: signed out).</summary>
-    private async Task<WebApplication> StartAsync()
+    private async Task<WebApplication> StartAsync(string? database = null)
     {
-        var connection = await pg.NewDatabaseAsync();
+        var connection = database ?? await pg.NewDatabaseAsync();
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
         builder.Services.AddWincheRealtime(o => { o.ConnectionString = connection; o.UseRulesText(Rules); });
@@ -123,6 +123,27 @@ public class SocketTests(PostgresFixture pg)
 
         await using var nobody = await ConnectAsync(app, null);
         Assert.Equal("permission-denied", (string?)(await nobody.RequestAsync(new JsonObject { ["type"] = "subscribe", ["path"] = "sessions/s1" }))["error"]!["code"]);
+    }
+
+    [Fact]
+    public async Task Followers_on_another_server_get_items_appended_on_this_one_once()
+    {
+        var database = await pg.NewDatabaseAsync();
+        await using var one = await StartAsync(database);
+        await using var two = await StartAsync(database);
+        await using var ann = await ConnectAsync(one, "ann");
+        await using var bob = await ConnectAsync(two, "bob");
+        var subscription = (string)(await bob.RequestAsync(new JsonObject { ["type"] = "subscribe", ["path"] = "sessions/s1" }))["result"]!["subscription"]!;
+        await Task.Delay(300);   // the second server's relay listening
+        await ann.RequestAsync(Append("sessions/s1", "ann:1"));
+        await ann.RequestAsync(Append("sessions/s1", "ann:2", "ann:3"));
+        var seen = await bob.ItemsAsync(subscription, upTo: 3);
+        Assert.Equal([1L, 2L, 3L], seen.Select(i => (long)i["position"]!));
+
+        // Closing on one server reaches followers on the other.
+        await using var host = await ConnectAsync(one, "host,host");
+        await host.RequestAsync(new JsonObject { ["type"] = "close", ["path"] = "sessions/s1" });
+        await bob.WaitForAsync(f => (string?)f["type"] == "state" && (string?)f["subscription"] == subscription && (string?)f["state"] == "closed");
     }
 
     [Fact]

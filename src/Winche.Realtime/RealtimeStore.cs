@@ -15,6 +15,9 @@ public sealed class RealtimeStore : IAsyncDisposable
 {
     public const string Lists = "winche_realtime_lists", Items = "winche_realtime_items";
 
+    /// <summary>The Postgres channel lists' changes are announced on: <c>{last position}\n{path}</c>, after commit.</summary>
+    public const string Channel = "winche_realtime";
+
     private static readonly string[] Schema =
     [
         $"""
@@ -42,6 +45,7 @@ public sealed class RealtimeStore : IAsyncDisposable
 
     private readonly WincheRealtimeOptions _options;
     private readonly NpgsqlDataSource _db;
+    internal NpgsqlDataSource DataSource => _db;
     private volatile bool _ready;
 
     public RealtimeStore(WincheRealtimeOptions options)
@@ -72,6 +76,7 @@ public sealed class RealtimeStore : IAsyncDisposable
         await using var conn = await _db.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
         var list = await LockAsync(conn, tx, path, create: true, ct);
+        var now = _options.Time.GetUtcNow();
 
         // What's there already under these keys.
         var keys = items.Select(i => i.Key).Distinct().ToArray();
@@ -119,7 +124,6 @@ public sealed class RealtimeStore : IAsyncDisposable
             if (list.Bytes + bytes > _options.MaxListBytes)
                 throw new RealtimeException(WincheErrorCode.ResourceExhausted, $"{path} would hold more than {_options.MaxListBytes} bytes.", "list-full");
 
-            var now = DateTimeOffset.UtcNow;
             var next = list.Count;
             await using (var insert = new NpgsqlBatch(conn, tx))
             {
@@ -143,6 +147,7 @@ public sealed class RealtimeStore : IAsyncDisposable
             update.Parameters.Add(new() { Value = bytes });
             update.Parameters.Add(new() { Value = now });
             await update.ExecuteNonQueryAsync(ct);
+            await AnnounceAsync(conn, tx, path, next, ct);
         }
         for (var i = 0; i < positions.Length; i++)
             if (positions[i] < 0) positions[i] = positions[-(int)positions[i] - 1];
@@ -188,6 +193,7 @@ public sealed class RealtimeStore : IAsyncDisposable
         await using var conn = await _db.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
         var list = await LockAsync(conn, tx, path, create: true, ct);
+        await AnnounceAsync(conn, tx, path, list.Count, ct);
         await tx.CommitAsync(ct);
         return list;
     }
@@ -197,22 +203,102 @@ public sealed class RealtimeStore : IAsyncDisposable
     {
         CheckPath(path);
         await EnsureAsync(ct);
+        await using var conn = await _db.OpenConnectionAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+        RealtimeListInfo list;
+        await using (var cmd = new NpgsqlCommand($"""
+            UPDATE {Lists} SET state = 'closed', closed_at = COALESCE(closed_at, $2) WHERE path = $1
+            RETURNING path, state, count, bytes, opened_at, closed_at
+            """, conn, tx))
+        {
+            cmd.Parameters.Add(new() { Value = path });
+            cmd.Parameters.Add(new() { Value = _options.Time.GetUtcNow() });
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            list = await r.ReadAsync(ct) ? Info(r) : throw new RealtimeException(WincheErrorCode.NotFound, $"There's no list at {path}.");
+        }
+        await AnnounceAsync(conn, tx, path, list.Count, ct);
+        await tx.CommitAsync(ct);
+        return list;
+    }
+
+    // ── the sweep's ─────────────────────────────────────────────────────────────
+
+    /// <summary>Closes open lists with no item (nor opening) since <paramref name="before"/>: the lists closed.</summary>
+    internal async Task<IReadOnlyList<RealtimeListInfo>> CloseIdleAsync(DateTimeOffset before, int limit, CancellationToken ct)
+    {
+        await EnsureAsync(ct);
+        var closed = new List<RealtimeListInfo>();
         await using var cmd = _db.CreateCommand($"""
-            UPDATE {Lists} SET state = 'closed', closed_at = COALESCE(closed_at, now()) WHERE path = $1
+            UPDATE {Lists} SET state = 'closed', closed_at = $2
+            WHERE path IN (SELECT path FROM {Lists} WHERE state = 'open' AND COALESCE(last_at, opened_at) < $1 LIMIT $3 FOR UPDATE SKIP LOCKED)
             RETURNING path, state, count, bytes, opened_at, closed_at
             """);
-        cmd.Parameters.Add(new() { Value = path });
+        cmd.Parameters.Add(new() { Value = before });
+        cmd.Parameters.Add(new() { Value = _options.Time.GetUtcNow() });
+        cmd.Parameters.Add(new() { Value = limit });
+        await using (var r = await cmd.ExecuteReaderAsync(ct))
+            while (await r.ReadAsync(ct)) closed.Add(Info(r));
+        foreach (var list in closed)
+        {
+            await using var announce = _db.CreateCommand("SELECT pg_notify($1, $2)");
+            announce.Parameters.Add(new() { Value = Channel });
+            announce.Parameters.Add(new() { Value = $"{list.Count}\n{list.Path}" });
+            await announce.ExecuteNonQueryAsync(ct);
+        }
+        return closed;
+    }
+
+    /// <summary>Closed lists closed before <paramref name="before"/>: due for archiving and deleting.</summary>
+    internal async Task<IReadOnlyList<RealtimeListInfo>> ExpiredAsync(DateTimeOffset before, int limit, CancellationToken ct)
+    {
+        await EnsureAsync(ct);
+        var due = new List<RealtimeListInfo>();
+        await using var cmd = _db.CreateCommand($"""
+            SELECT path, state, count, bytes, opened_at, closed_at FROM {Lists}
+            WHERE state = 'closed' AND closed_at < $1 ORDER BY closed_at LIMIT $2
+            """);
+        cmd.Parameters.Add(new() { Value = before });
+        cmd.Parameters.Add(new() { Value = limit });
         await using var r = await cmd.ExecuteReaderAsync(ct);
-        return await r.ReadAsync(ct) ? Info(r) : throw new RealtimeException(WincheErrorCode.NotFound, $"There's no list at {path}.");
+        while (await r.ReadAsync(ct)) due.Add(Info(r));
+        return due;
+    }
+
+    /// <summary>Deletes a closed list and its items.</summary>
+    internal async Task DeleteAsync(string path, CancellationToken ct)
+    {
+        await using var conn = await _db.OpenConnectionAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+        await using (var items = new NpgsqlCommand($"DELETE FROM {Items} WHERE path = $1", conn, tx))
+        {
+            items.Parameters.Add(new() { Value = path });
+            await items.ExecuteNonQueryAsync(ct);
+        }
+        await using (var list = new NpgsqlCommand($"DELETE FROM {Lists} WHERE path = $1 AND state = 'closed'", conn, tx))
+        {
+            list.Parameters.Add(new() { Value = path });
+            await list.ExecuteNonQueryAsync(ct);
+        }
+        await tx.CommitAsync(ct);
+    }
+
+    /// <summary>Announces the path's change to every server (delivered when the transaction commits).</summary>
+    private static async Task AnnounceAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string path, long last, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand("SELECT pg_notify($1, $2)", conn, tx);
+        cmd.Parameters.Add(new() { Value = Channel });
+        cmd.Parameters.Add(new() { Value = $"{last}\n{path}" });
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     /// <summary>The list row, locked for this transaction (made first when <paramref name="create"/>).</summary>
-    private static async Task<RealtimeListInfo> LockAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string path, bool create, CancellationToken ct)
+    private async Task<RealtimeListInfo> LockAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string path, bool create, CancellationToken ct)
     {
         if (create)
         {
-            await using var make = new NpgsqlCommand($"INSERT INTO {Lists} (path, state, opened_at) VALUES ($1, 'open', now()) ON CONFLICT (path) DO NOTHING", conn, tx);
+            await using var make = new NpgsqlCommand($"INSERT INTO {Lists} (path, state, opened_at) VALUES ($1, 'open', $2) ON CONFLICT (path) DO NOTHING", conn, tx);
             make.Parameters.Add(new() { Value = path });
+            make.Parameters.Add(new() { Value = _options.Time.GetUtcNow() });
             await make.ExecuteNonQueryAsync(ct);
         }
         await using var cmd = new NpgsqlCommand($"SELECT path, state, count, bytes, opened_at, closed_at FROM {Lists} WHERE path = $1 FOR UPDATE", conn, tx);
