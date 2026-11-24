@@ -51,10 +51,24 @@ public sealed class WincheRealtimeOptions
     /// <summary>Where closed lists go before they're deleted, if anywhere.</summary>
     public IRealtimeArchive? Archive { get; private set; }
 
+    /// <summary>Whether closed lists go to the <see cref="Archive"/> before they're deleted (on with <see cref="UseArchive"/>; the settings can turn it off).</summary>
+    public bool ArchiveClosedLists { get; set; }
+
     /// <summary>Archives each closed list (one gzipped NDJSON file) before it's deleted.</summary>
-    public WincheRealtimeOptions UseArchive(IRealtimeArchive archive)
+    public WincheRealtimeOptions UseArchive(IRealtimeArchive archive, bool on = true)
     {
         Archive = archive ?? throw new ArgumentNullException(nameof(archive));
+        ArchiveClosedLists = on;
+        return this;
+    }
+
+    /// <summary>Whether the console may change these settings (the area <c>realtime</c>): <see cref="UseSettings"/>.</summary>
+    public bool SettingsEnabled { get; private set; }
+
+    /// <summary>Lets the console change lifecycle, archiving and limits (settings area <c>realtime</c>).</summary>
+    public WincheRealtimeOptions UseSettings()
+    {
+        SettingsEnabled = true;
         return this;
     }
 

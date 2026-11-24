@@ -120,6 +120,18 @@ public class SweepTests(PostgresFixture pg)
     }
 
     [Fact]
+    public async Task With_archiving_turned_off_closed_lists_are_deleted_without_archiving()
+    {
+        var (lists, sweeper, clock, archive, options) = await Start();
+        options.ArchiveClosedLists = false;
+        await lists.AppendAsync(null, "sessions/s1", [Item("a:1")]);
+        await lists.Store.CloseAsync("sessions/s1");
+        clock.Now += TimeSpan.FromDays(31);
+        Assert.Equal((0, 1), (await sweeper.RunOnceAsync()) is { } s ? (s.Archived, s.Deleted) : default);
+        Assert.Empty(archive.Kept);
+    }
+
+    [Fact]
     public async Task Two_servers_sweeping_at_once_archive_each_list_once()
     {
         var (lists, sweeper, clock, archive, options) = await Start();

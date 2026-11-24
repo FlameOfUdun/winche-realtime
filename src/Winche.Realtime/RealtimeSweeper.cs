@@ -87,7 +87,7 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
         int archived = 0, deleted = 0, failed = 0;
         foreach (var list in await store.ExpiredAsync(now - options.RetainClosedFor, Batch, token))
         {
-            if (options.Archive is { } archive)
+            if (options.Archive is { } archive && options.ArchiveClosedLists)
             {
                 try
                 {

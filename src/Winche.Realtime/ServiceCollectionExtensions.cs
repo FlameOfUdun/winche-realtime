@@ -21,6 +21,11 @@ public static class ServiceCollectionExtensions
         configure(options);
         if (string.IsNullOrWhiteSpace(options.ConnectionString)) throw new ArgumentException("Winche Realtime needs a ConnectionString.");
         services.AddSingleton(options);
+        if (options.SettingsEnabled)
+        {
+            var area = Winche.Core.ServiceCollectionExtensions.AddWincheSettingsArea(services, RealtimeSettings.Area, "Realtime", RealtimeSettings.From(options), s => s.Problems());
+            area.Changed += s => s.ApplyTo(options);
+        }
         services.AddSingleton(new RealtimeStore(options));
         services.AddSingleton<RealtimeNotifier>();
         services.AddWincheRules(RulesKey, o => o.WithMutableRuleSetRepository(RuleSet.Merge(options.Rulesets)));
