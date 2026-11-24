@@ -58,7 +58,7 @@ public sealed record RealtimeSweep(int Closed, int Archived, int Deleted, int Fa
 /// archived (when there's an archive) and deleted. A list the archive can't take stays for the next sweep.
 /// </summary>
 public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions options, RealtimeNotifier notifier, ILogger? log = null,
-    RealtimePresence? presence = null)
+    RealtimePresence? presence = null, RealtimeChanges? changes = null)
 {
     private readonly ILogger _log = log ?? NullLogger.Instance;
     private const int Batch = 200;
@@ -80,6 +80,7 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
             {
                 closed++;
                 notifier.Changed(list.Path, list.Count);
+                if (changes is not null) await changes.ClosedAsync(list, token);
                 _log.LogInformation("Realtime closed {Path}: no item for {Idle}.", list.Path, idle);
             }
         }

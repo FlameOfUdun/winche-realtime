@@ -29,14 +29,17 @@ public static class ServiceCollectionExtensions
         services.AddSingleton(new RealtimeStore(options));
         services.AddSingleton<RealtimeNotifier>();
         services.AddWincheRules(RulesKey, o => o.WithMutableRuleSetRepository(RuleSet.Merge(options.Rulesets)));
+        services.AddSingleton(RealtimeChanges.Source);
+        services.AddSingleton(sp => new RealtimeChanges(sp.GetServices<IWincheChangeSink>()));
         services.AddSingleton(sp => new RealtimeLists(sp.GetRequiredService<RealtimeStore>(), sp.GetRequiredKeyedService<RuleEngine>(RulesKey),
-            sp.GetRequiredService<RealtimeNotifier>()));
+            sp.GetRequiredService<RealtimeNotifier>(), sp.GetRequiredService<RealtimeChanges>()));
         services.AddSingleton<RealtimeNode>();
         services.AddSingleton(sp => new RealtimeChannels(sp.GetRequiredService<RealtimeLists>(), sp.GetRequiredService<RealtimeNode>(), options));
         services.AddSingleton(sp => new RealtimePresence(sp.GetRequiredService<RealtimeLists>(), sp.GetRequiredService<RealtimeNode>(), options,
             sp.GetService<Microsoft.Extensions.Logging.ILoggerFactory>()?.CreateLogger("Winche.Realtime.Presence")));
         services.AddSingleton(sp => new RealtimeSweeper(sp.GetRequiredService<RealtimeStore>(), options, sp.GetRequiredService<RealtimeNotifier>(),
-            sp.GetService<Microsoft.Extensions.Logging.ILoggerFactory>()?.CreateLogger("Winche.Realtime.Sweep"), sp.GetRequiredService<RealtimePresence>()));
+            sp.GetService<Microsoft.Extensions.Logging.ILoggerFactory>()?.CreateLogger("Winche.Realtime.Sweep"), sp.GetRequiredService<RealtimePresence>(),
+            sp.GetRequiredService<RealtimeChanges>()));
         // Several servers share lists, messages and presence through Postgres; each checks in; one sweeps at a time.
         // On a host whose products are started (Winche Server), once Realtime is; otherwise at once.
         services.AddSingleton<IWincheProductSetup, RealtimeProductSetup>();

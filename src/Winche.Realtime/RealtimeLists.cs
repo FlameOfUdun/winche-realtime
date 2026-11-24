@@ -16,7 +16,7 @@ namespace Winche.Realtime;
 /// key's part before its first <c>:</c>) and <c>device</c> (the one device all its keys belong to, or null), so a rule can
 /// say <c>request.resource.device == request.auth.uid</c>. Payloads are never shown to rules.
 /// </remarks>
-public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, RealtimeNotifier notifier)
+public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, RealtimeNotifier notifier, RealtimeChanges? changes = null)
 {
     public RealtimeStore Store { get; } = store;
     public RealtimeNotifier Notifier { get; } = notifier;
@@ -69,6 +69,7 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
         await RequireAsync(RuleOperation.Update, "close", path, caller, await Store.InfoAsync(path, ct), null, ct);
         var list = await Store.CloseAsync(path, ct);
         Notifier.Changed(path, list.Count);
+        if (changes is not null) await changes.ClosedAsync(list, ct);
         return list;
     }
 
