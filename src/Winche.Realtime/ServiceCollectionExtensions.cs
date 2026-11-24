@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Winche.Core;
 using Winche.Rules;
 using Winche.Rules.DependencyInjection;
 
@@ -32,9 +33,11 @@ public static class ServiceCollectionExtensions
         services.AddSingleton(sp => new RealtimeSweeper(sp.GetRequiredService<RealtimeStore>(), options, sp.GetRequiredService<RealtimeNotifier>(),
             sp.GetService<Microsoft.Extensions.Logging.ILoggerFactory>()?.CreateLogger("Winche.Realtime.Sweep"), sp.GetRequiredService<RealtimePresence>()));
         // Several servers share lists, messages and presence through Postgres; each checks in; one sweeps at a time.
-        services.AddHostedService<RealtimeRelay>();
-        services.AddHostedService<RealtimeHeartbeat>();
-        services.AddHostedService<RealtimeSweepService>();
+        // On a host whose products are started (Winche Server), once Realtime is; otherwise at once.
+        services.AddSingleton<IWincheProductSetup, RealtimeProductSetup>();
+        services.AddWincheProductService<RealtimeRelay>(RealtimeProductSetup.Name);
+        services.AddWincheProductService<RealtimeHeartbeat>(RealtimeProductSetup.Name);
+        services.AddWincheProductService<RealtimeSweepService>(RealtimeProductSetup.Name);
         return services;
     }
 }
