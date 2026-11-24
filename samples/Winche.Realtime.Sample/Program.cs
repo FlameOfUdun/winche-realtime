@@ -38,5 +38,6 @@ var app = builder.Build();
 app.UseWebSockets();
 app.UseWincheCaller();
 app.MapWincheRealtimeWsApi();
-app.MapGet("/", () => "Winche Realtime sample: ws://…/realtime/v1/ws?access_token=<uid>");
+app.UseDefaultFiles();
+app.UseStaticFiles();   // wwwroot/index.html: a demo page (open it in two tabs)
 app.Run();

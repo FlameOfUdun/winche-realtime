@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Realtime demo</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#667085; --line:#e3e6eb; --accent:#3b5bdb; --ok:#2b8a3e; --bad:#c92a2a; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12151b; --card:#1b2029; --fg:#e7eaf0; --muted:#98a2b3; --line:#2c3340; --accent:#748ffc; --ok:#69db7c; --bad:#ff8787; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); padding:16px; }
+  header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:16px; }
+  h1 { font-size:18px; margin:0 12px 0 0; }
+  input, button { font:inherit; padding:6px 10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  button { cursor:pointer; background:var(--accent); color:#fff; border:none; }
+  button.quiet { background:transparent; color:var(--accent); border:1px solid var(--line); }
+  .status { font-size:12px; color:var(--muted); }
+  .status.on { color:var(--ok); } .status.off { color:var(--bad); }
+  main { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; min-width:0; }
+  h2 { font-size:14px; margin:0 0 4px; } .hint { color:var(--muted); font-size:12px; margin:0 0 8px; }
+  .row { display:flex; gap:6px; margin-bottom:8px; } .row input { flex:1; min-width:0; }
+  ol, ul { margin:0; padding-left:0; list-style:none; max-height:320px; overflow:auto; }
+  li { padding:4px 0; border-top:1px solid var(--line); font-size:13px; overflow-wrap:anywhere; }
+  .pos { color:var(--muted); font-variant-numeric:tabular-nums; margin-right:6px; }
+  .by { color:var(--accent); margin-right:6px; }
+  #log { font:12px ui-monospace, monospace; color:var(--muted); white-space:pre-wrap; max-height:120px; overflow:auto; margin-top:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Winche Realtime demo</h1>
+  <input id="name" placeholder="Your name (e.g. ann)" size="14">
+  <input id="path" value="sessions/demo" size="16">
+  <button id="connect">Connect</button>
+  <span id="status" class="status off">not connected</span>
+</header>
+<main>
+  <section>
+    <h2>Shared list</h2>
+    <p class="hint">Every tab sees the same items in the same order. Reload a tab: it catches up.</p>
+    <div class="row"><input id="text" placeholder="Something that happened"><button id="append">Add</button></div>
+    <ol id="items"></ol>
+  </section>
+  <section>
+    <h2>Channel: telemetry</h2>
+    <p class="hint">Live messages, never kept: a tab that opens later doesn't see earlier ones.</p>
+    <div class="row"><input id="message" placeholder="e.g. heart rate 72"><button id="publish">Send</button></div>
+    <ul id="messages"></ul>
+  </section>
+  <section>
+    <h2>Who's here</h2>
+    <p class="hint">Join, then close the tab: the others see you leave, and a "left" item appears in the list.</p>
+    <div class="row"><button id="join">Join</button><button id="leave" class="quiet">Leave</button></div>
+    <ul id="members"></ul>
+  </section>
+</main>
+<div id="log"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+let ws, next = 1, last = 0, seq = Date.now();
+const pending = new Map();
+const log = (t) => { $("log").textContent = (new Date().toLocaleTimeString() + "  " + t + "\n" + $("log").textContent).slice(0, 4000); };
+const b64 = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+const text = (b) => new TextDecoder().decode(Uint8Array.from(atob(b), (c) => c.charCodeAt(0)));
+const me = () => $("name").value.trim();
+const path = () => $("path").value.trim();
+function send(frame) {
+  return new Promise((resolve, reject) => {
+    const id = "r" + next++;
+    pending.set(id, { resolve, reject });
+    ws.send(JSON.stringify({ ...frame, id }));
+  });
+}
+function status(on, t) { const s = $("status"); s.textContent = t; s.className = "status " + (on ? "on" : "off"); }
+function connect() {
+  if (!me()) { $("name").focus(); return; }
+  ws?.close();
+  last = 0; $("items").innerHTML = ""; $("messages").innerHTML = ""; $("members").innerHTML = "";
+  ws = new WebSocket(location.origin.replace("http", "ws") + "/realtime/v1/ws?access_token=" + encodeURIComponent(me()));
+  ws.onmessage = async (e) => {
+    const f = JSON.parse(e.data);
+    if (f.type === "welcome") {
+      status(true, "connected as " + me());
+      await send({ type: "subscribe", path: path(), after: last });
+      await send({ type: "listen", path: path(), channel: "telemetry" });
+      const w = await send({ type: "watch", path: path() });
+      showMembers(w.members);
+      log("following " + path());
+    } else if (f.type === "response" || f.type === "error") {
+      const p = pending.get(f.id); pending.delete(f.id);
+      if (f.type === "error") { log("refused: " + f.error.message); p?.reject(f.error); } else p?.resolve(f.result);
+    } else if (f.type === "items") {
+      for (const i of f.items) {
+        if (i.position <= last) continue;
+        last = i.position;
+        const li = document.createElement("li");
+        li.innerHTML = `<span class="pos">#${i.position}</span><span class="by">${i.by ?? "?"}</span>`;
+        li.append(document.createTextNode(JSON.parse(text(i.payload)).text ?? text(i.payload)));
+        $("items").prepend(li);
+      }
+    } else if (f.type === "message") {
+      const li = document.createElement("li");
+      li.innerHTML = `<span class="by">${f.by ?? "?"}</span>`;
+      li.append(document.createTextNode(text(f.payload)));
+      $("messages").prepend(li);
+    } else if (f.type === "presence") {
+      showMembers(f.members);
+    } else if (f.type === "state") {
+      log("the list is " + f.state);
+    }
+  };
+  ws.onclose = (e) => { status(false, "disconnected" + (e.code ? " (" + e.code + ")" : "")); };
+}
+function showMembers(members) {
+  $("members").innerHTML = members.length ? "" : "<li class='hint'>Nobody has joined.</li>";
+  for (const m of members) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="by">${m.uid}</span>`;
+    li.append(document.createTextNode("since " + new Date(m.joinedAt).toLocaleTimeString()));
+    $("members").append(li);
+  }
+}
+$("connect").onclick = connect;
+$("append").onclick = async () => {
+  const t = $("text").value.trim(); if (!t) return;
+  await send({ type: "append", path: path(), items: [{ key: `${me()}:${seq++}`, payload: b64(JSON.stringify({ text: t })) }] });
+  $("text").value = "";
+};
+$("publish").onclick = async () => {
+  const t = $("message").value.trim(); if (!t) return;
+  await send({ type: "publish", path: path(), channel: "telemetry", payload: b64(t) });
+  $("message").value = "";
+};
+$("join").onclick = () => send({ type: "join", path: path(), data: { tab: navigator.userAgent.includes("Firefox") ? "firefox" : "browser" },
+  onDisconnect: { key: `${me()}:left-${seq++}`, payload: b64(JSON.stringify({ text: `${me()} left without saying goodbye` })) } });
+$("leave").onclick = () => send({ type: "leave", path: path() });
+for (const [field, button] of [["text", "append"], ["message", "publish"], ["name", "connect"]])
+  $(field).addEventListener("keydown", (e) => { if (e.key === "Enter") $(button).click(); });
+</script>
+</body>
+</html>
