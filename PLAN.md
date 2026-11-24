@@ -44,10 +44,11 @@ number of channels (named under it: `sessions/{id}#telemetry`) and a presence se
   list takes no appends and still reads.
 - Only an index on `(path, position)` besides the key: no change feed, no history, no per-item rules.
 
-## Socket (`/realtime/v1/ws`, per project)
+## Socket (`/projects/{id}/realtime/v1/ws` on Winche Server)
 
-Its own WebSocket, signed in like the other products (the project's trusted issuers or Winche Auth; a token refresh
-doesn't drop it). JSON frames with an id per request; items' payloads base64 (a binary frame mode can come later).
+Its own WebSocket, signed in like the other products (the project's trusted issuers or Winche Auth, its session still
+standing; a token refresh doesn't drop it), and under the project's Integrity enforcement like them (its own product
+entry under Integrity → Enforcement). JSON frames with an id per request; items' payloads base64 (a binary frame mode can come later).
 
 | Frame | What |
 | --- | --- |
@@ -70,7 +71,8 @@ their position.
 
 Per path, default deny. Operations: `append`, `read` (subscribe and read), `close`, `open`, `publish`, `listen`,
 `join`, `watch`. They see `request.auth`, the path captures, the list (`state`, `count`, `bytes`) and, for an append,
-the batch's size (not the payloads: opaque). Checked once when a subscription starts or a batch arrives, not per item
+the batch's size (not the payloads: opaque), and each item's key (so a rule can require `{device}:{seq}` keys whose
+device part is the signed-in device, and one device can't append as another). Checked once when a subscription starts or a batch arrives, not per item
 delivered. A rule may read a database document (e.g. "a member of this session"), as storage rules can.
 
 ## Server side
@@ -107,10 +109,9 @@ delivered. A rule may read a database document (e.g. "a member of this session")
 5. **Functions** (`ctx.realtime`, triggers), **console** section, **CLI** emulator and rules deploy.
 6. **README, release:** Winche.Realtime 1.0, the server, the CLI, `winche_realtime` 0.1.
 
-## Open questions
+## Decided (2026-11-24)
 
-- Binary frames (and a compact encoding for payloads) from the start, or JSON + base64 first?
-- Should a list's `position` be visible to rules (e.g. "only the first 10,000 items")?
-- Archive format and whether a function can read an archived list back.
-- Per-device identity: let rules require that a key's device part matches the signed-in device, so one device can't
-  append as another.
+- **Payloads:** JSON frames with base64 payloads first; binary frames later, without breaking anything.
+- **Rules see the list's size:** `count` and `bytes` (e.g. "only the first 10,000 items").
+- **Archive:** one gzipped NDJSON file per list in Winche Storage; a function reads it back as a file (no re-open).
+- **Per-device keys:** rules see each appended key, so they can require its device part to match the signed-in device.
