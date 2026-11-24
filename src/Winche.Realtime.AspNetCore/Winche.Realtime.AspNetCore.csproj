@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>Winche.Realtime.AspNetCore</PackageId>
+    <Description>The WebSocket for Winche Realtime: append to lists, subscribe from a position and read pages, signed in like the other Winche products.</Description>
+    <PackageTags>realtime;websocket;aspnetcore</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Winche.Realtime.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Winche.Realtime\Winche.Realtime.csproj" />
+    <PackageReference Include="Winche.Core.AspNetCore" Version="2.0.0" />
+  </ItemGroup>
+</Project>

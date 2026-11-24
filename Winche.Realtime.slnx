@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Winche.Realtime/Winche.Realtime.csproj" />
+    <Project Path="src/Winche.Realtime.AspNetCore/Winche.Realtime.AspNetCore.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Winche.Realtime.Tests/Winche.Realtime.Tests.csproj" />
+  </Folder>
+</Solution>

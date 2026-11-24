@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>Winche.Realtime</PackageId>
+    <Description>PostgreSQL-backed realtime lists for Winche: ordered, append-only, deduplicated by the client's keys, read from a position, with path rules and limits.</Description>
+    <PackageTags>realtime;lists;events;postgresql;npgsql</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Winche.Realtime.Tests" />
+    <InternalsVisibleTo Include="Winche.Realtime.AspNetCore" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.5" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.5" />
+    <PackageReference Include="Npgsql" Version="10.0.2" />
+    <PackageReference Include="Winche.Rules" Version="5.0.0" />
+    <PackageReference Include="Winche.Core" Version="2.0.0" />
+  </ItemGroup>
+</Project>
