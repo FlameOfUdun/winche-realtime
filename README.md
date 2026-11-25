@@ -77,10 +77,27 @@ the last position you got. Nothing is lost.
 
 ## Rules
 
-Per path, default deny, with the shared operations. Lists are ruled at their path; channels at
-`channels/{path}/{channel}` (`create` to publish, with `request.resource.bytes`; `get` to listen); presence at
-`presence/{path}` (`create` to join, `get` to watch). An on-disconnect item is checked against the list's `create` rule
-when joining, so a drop never appends what the member couldn't have.
+Per path, default deny, with the shared operations. Paths are the app's own (`sessions/s1`, `rooms/lobby`). Lists
+are ruled at their path; a path's channels at `{path}/channels/{channel}` (`create` to publish, with
+`request.resource.bytes`; `get` to listen); its presence at `{path}/presence` (`create` to join, `get` to watch). So
+paths never use the words `channels` or `presence`, and one block holds a path's rules:
+
+```
+match sessions/{s} {                  // the list sessions/s1
+  allow get: if request.auth != null;
+  allow create: if request.resource.device == request.auth.uid;
+  match channels/{name} {             // sessions/s1/channels/telemetry
+    allow get, create: if request.auth != null;
+  }
+  match presence {                    // sessions/s1/presence
+    allow get, create: if request.auth != null;
+  }
+}
+```
+
+A rule covers exactly the path it matches: `match sessions/{s}` doesn't cover its channels or presence, nor they it.
+An on-disconnect item is checked against the list's `create` rule when joining, so a drop never appends what the
+member couldn't have.
 
 | Operation | Covers |
 | --- | --- |

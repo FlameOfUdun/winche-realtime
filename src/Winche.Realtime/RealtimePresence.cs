@@ -14,7 +14,7 @@ public sealed record RealtimeMember(string? Uid, JsonObject? Data, DateTimeOffse
 /// <summary>
 /// Presence: who is connected at a path, the same on every server (a table, with each server checking in), and what
 /// happens when a connection ends without leaving: the item it gave (<c>onDisconnect</c>) is appended to the path's
-/// list, as it. Rules see it at <c>presence/{path}</c>: <c>create</c> to join, <c>get</c> to watch; an on-disconnect
+/// list, as it. Rules see it at <c>{path}/presence</c>: <c>create</c> to join, <c>get</c> to watch; an on-disconnect
 /// item is checked against the list's rules when joining.
 /// </summary>
 public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, WincheRealtimeOptions options, ILogger? log = null)
@@ -34,7 +34,7 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
         var json = data?.ToJsonString();
         if (json is not null && json.Length > options.MaxPresenceDataBytes)
             throw new RealtimeException(WincheErrorCode.InvalidArgument, $"Presence data is at most {options.MaxPresenceDataBytes} bytes of JSON.");
-        await lists.RequireAsync(RuleOperation.Create, "join", $"presence/{path}", caller, null, null, ct);
+        await lists.RequireAsync(RuleOperation.Create, "join", $"{path}/presence", caller, null, null, ct);
         if (onDisconnect is not null) await lists.CanAppendAsync(caller, path, [onDisconnect], ct);
         await BeatAsync(ct);
         await using var cmd = Store.DataSource.CreateCommand($"""
@@ -91,7 +91,7 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
     public async Task CanWatchAsync(IReadOnlyDictionary<string, object?>? caller, string path, CancellationToken ct = default)
     {
         RealtimeStore.CheckPath(path);
-        await lists.RequireAsync(RuleOperation.Get, "watch", $"presence/{path}", caller, null, null, ct);
+        await lists.RequireAsync(RuleOperation.Get, "watch", $"{path}/presence", caller, null, null, ct);
     }
 
     /// <summary>This server checks in: its members stay while it does.</summary>

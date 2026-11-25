@@ -16,7 +16,7 @@ public sealed class RealtimeNode
 
 /// <summary>
 /// Channels: messages published at a path (<c>sessions/s1</c>, channel <c>telemetry</c>) reach everyone listening
-/// there, on every server, once, and are never stored. Rules see them at <c>channels/{path}/{channel}</c>:
+/// there, on every server, once, and are never stored. Rules see them at <c>{path}/channels/{channel}</c>:
 /// <c>create</c> to publish (<c>request.resource.bytes</c>), <c>get</c> to listen.
 /// </summary>
 public sealed class RealtimeChannels(RealtimeLists lists, RealtimeNode node, WincheRealtimeOptions options)
@@ -110,7 +110,7 @@ public sealed class RealtimeChannels(RealtimeLists lists, RealtimeNode node, Win
         }
     }
 
-    internal static string RulePath(string path, string channel) => $"channels/{path}/{channel}";
+    internal static string RulePath(string path, string channel) => $"{path}/channels/{channel}";
 
     private static void Check(string path, string channel)
     {

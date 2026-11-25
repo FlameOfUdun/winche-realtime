@@ -383,10 +383,16 @@ public sealed class RealtimeStore : IAsyncDisposable
     private static bool Same(byte[] a, byte[] b) => CryptographicOperations.FixedTimeEquals(a, b);
 
     /// <summary>A path: segments of letters, digits, <c>-</c>, <c>_</c>, <c>.</c>, <c>:</c> and <c>@</c>, separated by single slashes.</summary>
+    /// <summary>
+    /// A path: segments of letters, digits, - _ . : @. Never the words <c>channels</c> or <c>presence</c>: rules see a
+    /// path's channels at <c>{path}/channels/{channel}</c> and its presence at <c>{path}/presence</c>, and no list may land there.
+    /// </summary>
     internal static void CheckPath(string path)
     {
         if (string.IsNullOrEmpty(path) || path.Length > 512 || path.Split('/').Any(s => s.Length == 0 || !s.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.' or ':' or '@')))
             throw new RealtimeException(WincheErrorCode.InvalidArgument, $"'{path}' isn't a path: segments of letters, digits, - _ . : @, separated by single slashes (e.g. sessions/s1).");
+        if (path.Split('/').Any(s => s is "channels" or "presence"))
+            throw new RealtimeException(WincheErrorCode.InvalidArgument, $"'{path}': 'channels' and 'presence' aren't used in paths (rules see a path's channels at {{path}}/channels/… and its presence at {{path}}/presence).");
     }
 
     private void CheckBatch(IReadOnlyList<RealtimeItemIn> items)

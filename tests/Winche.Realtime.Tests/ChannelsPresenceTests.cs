@@ -17,13 +17,13 @@ public class ChannelsPresenceTests(PostgresFixture pg)
         match sessions/{session} {
           allow get: if request.auth != null;
           allow create: if request.auth != null && request.resource.device == request.auth.uid;
-        }
-        match channels/sessions/{session}/{channel} {
-          allow get: if request.auth != null;
-          allow create: if request.auth != null && channel != 'admin';
-        }
-        match presence/sessions/{session} {
-          allow get, create: if request.auth != null;
+          match channels/{channel} {
+            allow get: if request.auth != null;
+            allow create: if request.auth != null && channel != 'admin';
+          }
+          match presence {
+            allow get, create: if request.auth != null;
+          }
         }
         """;
 
@@ -115,6 +115,24 @@ public class ChannelsPresenceTests(PostgresFixture pg)
         var sent = await ann.RequestAsync(new() { ["type"] = "publish", ["path"] = "sessions/s1", ["channel"] = "telemetry", ["payload"] = Convert.ToBase64String(new byte[7000]) });
         Assert.Equal("invalid-argument", (string?)sent["error"]!["code"]);
         await cat.AssertSilenceAsync(f => (string?)f["type"] == "message", TimeSpan.FromMilliseconds(500));
+    }
+
+    [Theory]
+    [InlineData("sessions/s1/channels/telemetry")]
+    [InlineData("sessions/s1/presence")]
+    [InlineData("channels/x")]
+    [InlineData("presence")]
+    public async Task No_path_uses_the_words_channels_or_presence(string path)
+    {
+        await using var app = await StartAsync();
+        await using var ann = await ConnectAsync(app, "ann");
+        foreach (var frame in new JsonObject[]
+        {
+            new() { ["type"] = "append", ["path"] = path, ["items"] = new JsonArray(new JsonObject { ["key"] = "ann:1", ["payload"] = B64("x") }) },
+            new() { ["type"] = "publish", ["path"] = path, ["channel"] = "telemetry", ["payload"] = B64("x") },
+            new() { ["type"] = "join", ["path"] = path },
+        })
+            Assert.Equal("invalid-argument", (string?)(await ann.RequestAsync(frame))["error"]?["code"]);
     }
 
     [Fact]
