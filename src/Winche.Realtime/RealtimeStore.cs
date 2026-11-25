@@ -61,6 +61,8 @@ public sealed class RealtimeStore : IAsyncDisposable
         CREATE INDEX IF NOT EXISTS idx_{RealtimePresence.Members}_path ON {RealtimePresence.Members} (path);
         CREATE INDEX IF NOT EXISTS idx_{RealtimePresence.Members}_server ON {RealtimePresence.Members} (server_id);
         """,
+        // A closed list the archive couldn't take: when it last failed (it waits before it's tried again).
+        $"ALTER TABLE {Lists} ADD COLUMN IF NOT EXISTS archive_failed_at timestamptz;",
     ];
 
     private readonly WincheRealtimeOptions _options;
@@ -315,22 +317,34 @@ public sealed class RealtimeStore : IAsyncDisposable
     }
 
     /// <summary>Closed lists closed before <paramref name="before"/>: due for archiving and deleting.</summary>
-    internal async Task<IReadOnlyList<RealtimeListInfo>> ExpiredAsync(DateTimeOffset before, int limit, CancellationToken ct)
+    /// <summary>Closed lists due to go: closed before <paramref name="before"/>, and not failing to archive since <paramref name="retryBefore"/>.</summary>
+    internal async Task<IReadOnlyList<RealtimeListInfo>> ExpiredAsync(DateTimeOffset before, DateTimeOffset retryBefore, int limit, CancellationToken ct)
     {
         await EnsureAsync(ct);
         var due = new List<RealtimeListInfo>();
         await using var cmd = _db.CreateCommand($"""
             SELECT path, state, count, bytes, opened_at, closed_at FROM {Lists}
-            WHERE state = 'closed' AND closed_at < $1 ORDER BY closed_at LIMIT $2
+            WHERE state = 'closed' AND closed_at < $1 AND (archive_failed_at IS NULL OR archive_failed_at <= $3)
+            ORDER BY closed_at LIMIT $2
             """);
         cmd.Parameters.Add(new() { Value = before });
         cmd.Parameters.Add(new() { Value = limit });
+        cmd.Parameters.Add(new() { Value = retryBefore });
         await using var r = await cmd.ExecuteReaderAsync(ct);
         while (await r.ReadAsync(ct)) due.Add(Info(r));
         return due;
     }
 
     /// <summary>Deletes a closed list and its items.</summary>
+    /// <summary>The archive couldn't take the list at <paramref name="path"/>: it waits before it's tried again.</summary>
+    internal async Task ArchiveFailedAsync(string path, DateTimeOffset at, CancellationToken ct)
+    {
+        await using var cmd = _db.CreateCommand($"UPDATE {Lists} SET archive_failed_at = $2 WHERE path = $1");
+        cmd.Parameters.Add(new() { Value = path });
+        cmd.Parameters.Add(new() { Value = at });
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     internal async Task DeleteAsync(string path, CancellationToken ct)
     {
         await using var conn = await _db.OpenConnectionAsync(ct);
@@ -391,6 +405,8 @@ public sealed class RealtimeStore : IAsyncDisposable
     {
         if (string.IsNullOrEmpty(path) || path.Length > 512 || path.Split('/').Any(s => s.Length == 0 || !s.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.' or ':' or '@')))
             throw new RealtimeException(WincheErrorCode.InvalidArgument, $"'{path}' isn't a path: segments of letters, digits, - _ . : @, separated by single slashes (e.g. sessions/s1).");
+        if (path.Split('/').Any(s => s[0] == '.'))
+            throw new RealtimeException(WincheErrorCode.InvalidArgument, $"'{path}': a segment doesn't start with '.'.");
         if (path.Split('/').Any(s => s is "channels" or "presence"))
             throw new RealtimeException(WincheErrorCode.InvalidArgument, $"'{path}': 'channels' and 'presence' aren't used in paths (rules see a path's channels at {{path}}/channels/… and its presence at {{path}}/presence).");
     }

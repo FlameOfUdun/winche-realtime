@@ -16,8 +16,16 @@ public interface IRealtimeArchive
 
 public static class RealtimeArchives
 {
-    /// <summary>The file's name for the list at <paramref name="path"/>, relative: <c>{path}/archive.ndjson.gz</c>.</summary>
-    public static string FileName(string path) => $"{path}/archive.ndjson.gz";
+    /// <summary>
+    /// The file's name for a closed list, relative: <c>{path}/{closed at}.ndjson.gz</c> (e.g.
+    /// <c>sessions/s1/20261125T093015123Z.ndjson.gz</c>), so a path used again gets a file of its own. A ':' in the path
+    /// is written '~', which file names take everywhere and paths never have.
+    /// </summary>
+    public static string FileName(RealtimeListInfo list) =>
+        $"{list.Path.Replace(':', '~')}/{(list.ClosedAt ?? list.OpenedAt).UtcDateTime:yyyyMMdd'T'HHmmssfff'Z'}.ndjson.gz";
+
+    /// <summary>How long a list the archive couldn't take waits before it's tried again.</summary>
+    public static readonly TimeSpan RetryAfter = TimeSpan.FromHours(1);
 
     /// <summary>
     /// The list's items as gzipped NDJSON, an item a line: <c>{ key, position, at, by, payload }</c> (payload base64),
@@ -86,7 +94,7 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
         }
 
         int archived = 0, deleted = 0, failed = 0;
-        foreach (var list in await store.ExpiredAsync(now - options.RetainClosedFor, Batch, token))
+        foreach (var list in await store.ExpiredAsync(now - options.RetainClosedFor, now - RealtimeArchives.RetryAfter, Batch, token))
         {
             if (options.Archive is { } archive && options.ArchiveClosedLists)
             {
@@ -99,7 +107,8 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
                     failed++;
-                    _log.LogWarning(e, "Realtime couldn't archive {Path}: it's kept for the next sweep.", list.Path);
+                    await store.ArchiveFailedAsync(list.Path, now, token);
+                    _log.LogWarning(e, "Realtime couldn't archive {Path}: it's kept, and tried again in an hour.", list.Path);
                     continue;
                 }
             }

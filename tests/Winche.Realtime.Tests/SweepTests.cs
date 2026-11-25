@@ -21,12 +21,13 @@ public class SweepTests(PostgresFixture pg)
     {
         public readonly List<(RealtimeListInfo List, byte[] File)> Kept = [];
         public bool Fail;
+        public Func<RealtimeListInfo, bool>? FailFor;
         public TimeSpan Delay;
 
         public async Task ArchiveAsync(RealtimeListInfo list, Stream file, CancellationToken ct)
         {
             if (Delay > TimeSpan.Zero) await Task.Delay(Delay, ct);
-            if (Fail) throw new IOException("The archive is down.");
+            if (Fail || FailFor?.Invoke(list) == true) throw new IOException("The archive is down.");
             using var copy = new MemoryStream();
             await file.CopyToAsync(copy, ct);
             lock (Kept) Kept.Add((list, copy.ToArray()));
@@ -90,7 +91,53 @@ public class SweepTests(PostgresFixture pg)
         Assert.Equal(["a:1", "b:1", "a:2"], items.Select(i => (string)i["key"]!));
         Assert.Equal([1L, 2L, 3L], items.Select(i => (long)i["position"]!));
         Assert.Equal("p-b:1", Encoding.UTF8.GetString(Convert.FromBase64String((string)items[1]["payload"]!)));
-        Assert.Equal("sessions/s1/archive.ndjson.gz", RealtimeArchives.FileName("sessions/s1"));
+    }
+
+    [Fact]
+    public void Each_archive_has_a_name_of_its_own_that_any_storage_takes()
+    {
+        var closed = new DateTimeOffset(2026, 11, 25, 9, 30, 15, 123, TimeSpan.Zero);
+        RealtimeListInfo List(string path, DateTimeOffset at) => new(path, "closed", 1, 1) { ClosedAt = at };
+        Assert.Equal("sessions/s1/20261125T093015123Z.ndjson.gz", RealtimeArchives.FileName(List("sessions/s1", closed)));
+        // The same path used again: another file, the first one kept.
+        Assert.NotEqual(RealtimeArchives.FileName(List("sessions/s1", closed)), RealtimeArchives.FileName(List("sessions/s1", closed.AddDays(3))));
+        // ':' isn't a file name's: written as '~' (paths never have one).
+        Assert.Equal("sessions/user~1/20261125T093015123Z.ndjson.gz", RealtimeArchives.FileName(List("sessions/user:1", closed)));
+    }
+
+    [Theory]
+    [InlineData("sessions/.")]
+    [InlineData("sessions/..")]
+    [InlineData(".winche-x/s1")]
+    public async Task Paths_have_no_segment_starting_with_a_dot(string path)
+    {
+        var (lists, _, _, _, _) = await Start();
+        Assert.Equal(WincheErrorCode.InvalidArgument, (await Assert.ThrowsAsync<RealtimeException>(() => lists.AppendAsync(null, path, [Item("a:1")]))).Code);
+    }
+
+    [Fact]
+    public async Task Lists_that_keep_failing_to_archive_wait_an_hour_and_never_hold_up_the_rest()
+    {
+        var (lists, sweeper, clock, archive, _) = await Start();
+        archive.FailFor = l => l.Path.StartsWith("sessions/bad");
+        for (var n = 0; n < 201; n++)
+        {
+            await lists.AppendAsync(null, $"sessions/bad{n}", [Item("a:1")]);
+            await lists.Store.CloseAsync($"sessions/bad{n}");
+        }
+        clock.Now += TimeSpan.FromMinutes(1);
+        await lists.AppendAsync(null, "sessions/good", [Item("a:1")]);
+        await lists.Store.CloseAsync("sessions/good");   // closed after all of them: the last in line
+        clock.Now += TimeSpan.FromDays(31);
+        var first = (await sweeper.RunOnceAsync())!;
+        Assert.Equal((0, 200), (first.Archived, first.Failed));
+        var second = (await sweeper.RunOnceAsync())!;   // a minute later: the failed ones wait, the rest go
+        Assert.Equal((1, 1, 1), (second.Archived, second.Deleted, second.Failed));
+        Assert.Null(await lists.Store.InfoAsync("sessions/good"));
+        Assert.Equal(0, (await sweeper.RunOnceAsync())!.Failed);   // nothing retried within the hour
+        clock.Now += TimeSpan.FromHours(1);
+        archive.FailFor = null;
+        Assert.Equal(200, (await sweeper.RunOnceAsync())!.Archived);   // an hour on: tried again
     }
 
     [Fact]
@@ -105,6 +152,7 @@ public class SweepTests(PostgresFixture pg)
         Assert.Equal((0, 0, 1), (failed.Archived, failed.Deleted, failed.Failed));
         Assert.NotNull(await lists.Store.InfoAsync("sessions/s1"));   // nothing lost
         archive.Fail = false;
+        clock.Now += TimeSpan.FromHours(1);   // tried again an hour later
         Assert.Equal(1, (await sweeper.RunOnceAsync())!.Deleted);
     }
 
