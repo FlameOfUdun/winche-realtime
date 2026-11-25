@@ -37,10 +37,14 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
     }
 
     /// <summary>A page of the list, if the rules allow <c>get</c>.</summary>
-    public async Task<RealtimePage> ReadAsync(IReadOnlyDictionary<string, object?>? caller, string path, long after, int limit, CancellationToken ct = default)
+    public Task<RealtimePage> ReadAsync(IReadOnlyDictionary<string, object?>? caller, string path, long after, int limit, CancellationToken ct = default) =>
+        ReadAsync(caller, path, after, limit, long.MaxValue, ct);
+
+    /// <summary>As <see cref="ReadAsync(IReadOnlyDictionary{string, object?}?, string, long, int, CancellationToken)"/>, no more than <paramref name="maxBytes"/> of payloads.</summary>
+    public async Task<RealtimePage> ReadAsync(IReadOnlyDictionary<string, object?>? caller, string path, long after, int limit, long maxBytes, CancellationToken ct = default)
     {
         await CanReadAsync(caller, path, ct);
-        return await Store.ReadAsync(path, after, limit, ct);
+        return await Store.ReadAsync(path, after, limit, maxBytes, ct);
     }
 
     /// <summary>Whether the caller may read (and subscribe to) the list: refused with a <see cref="RealtimeException"/> if not; the list, or null.</summary>

@@ -175,8 +175,15 @@ public sealed class RealtimeStore : IAsyncDisposable
         return positions;
     }
 
-    /// <summary>Up to <paramref name="limit"/> items after position <paramref name="after"/>, in order, and the list.</summary>
-    public async Task<RealtimePage> ReadAsync(string path, long after, int limit, CancellationToken ct = default)
+    /// <summary>
+    /// Up to <paramref name="limit"/> items after position <paramref name="after"/>, in order, and the list; no more
+    /// than <paramref name="maxBytes"/> of payloads (always at least one item, if there is one).
+    /// </summary>
+    public async Task<RealtimePage> ReadAsync(string path, long after, int limit, CancellationToken ct = default) =>
+        await ReadAsync(path, after, limit, long.MaxValue, ct);
+
+    /// <inheritdoc cref="ReadAsync(string, long, int, CancellationToken)"/>
+    public async Task<RealtimePage> ReadAsync(string path, long after, int limit, long maxBytes, CancellationToken ct = default)
     {
         CheckPath(path);
         await EnsureAsync(ct);
@@ -184,14 +191,25 @@ public sealed class RealtimeStore : IAsyncDisposable
         var list = await InfoAsync(path, ct);
         if (list is null) return new RealtimePage([], null);
         var items = new List<RealtimeItem>();
-        await using var cmd = _db.CreateCommand($"SELECT key, position, at, by_uid, payload FROM {Items} WHERE path = $1 AND position > $2 ORDER BY position LIMIT $3");
+        // The page's items, then only those that start under the byte budget: the payloads past it never leave Postgres.
+        await using var cmd = _db.CreateCommand($"""
+            SELECT key, position, at, by_uid, payload FROM (
+              SELECT *, sum(octet_length(payload)) OVER (ORDER BY position) - octet_length(payload) AS before
+              FROM (SELECT key, position, at, by_uid, payload FROM {Items} WHERE path = $1 AND position > $2 ORDER BY position LIMIT $3) page
+            ) sized WHERE before < $4
+            ORDER BY position
+            """);
         cmd.Parameters.Add(new() { Value = path });
         cmd.Parameters.Add(new() { Value = Math.Max(0, after) });
         cmd.Parameters.Add(new() { Value = limit });
+        cmd.Parameters.Add(new() { Value = Math.Max(1, maxBytes) });
         await using var r = await cmd.ExecuteReaderAsync(ct);
         while (await r.ReadAsync(ct))
+        {
             items.Add(new RealtimeItem(r.GetString(0), r.GetInt64(1), r.GetFieldValue<DateTimeOffset>(2), r.IsDBNull(3) ? null : r.GetString(3), (byte[])r[4]));
-        return new RealtimePage(items, list);
+        }
+        // Positions run 1..count with no gaps: more after these if the last isn't the list's last.
+        return new RealtimePage(items, list) { More = items.Count > 0 && items[^1].Position < list.Count };
     }
 
     /// <summary>The list at <paramref name="path"/>, or null.</summary>

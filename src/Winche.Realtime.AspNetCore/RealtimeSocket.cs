@@ -20,8 +20,17 @@ public sealed class RealtimeSocketOptions
     /// <summary>The most subscriptions one connection may hold. Default 100.</summary>
     public int MaxSubscriptions { get; set; } = 100;
 
-    /// <summary>Frames waiting to go out before the server waits for the client (it reads on from its position after).</summary>
-    public int SendQueueLimit { get; set; } = 256;
+    /// <summary>
+    /// The most a connection's frames waiting to go out may add up to, in bytes. Default 8 MB. When it's full, the
+    /// connection's subscriptions wait (they read on from their positions after) and channel messages are dropped.
+    /// </summary>
+    public long SendQueueBytes { get; set; } = 8 * 1024 * 1024;
+
+    /// <summary>The most item payloads one frame (a subscription's page, a read's answer) carries, in bytes. Default 1 MB; always at least one item.</summary>
+    public long FrameBytes { get; set; } = 1024 * 1024;
+
+    /// <summary>How long a connection's queue may stay full before it's closed as too slow (<see cref="RealtimeSocketExtensions.SlowCloseCode"/>). Default 30 s.</summary>
+    public TimeSpan SlowClientTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>The most items a subscription sends in one frame. Default 500.</summary>
     public int ItemsPerFrame { get; set; } = 500;
@@ -31,6 +40,9 @@ public static class RealtimeSocketExtensions
 {
     /// <summary>A sign-in that has expired: the client signs in again and reconnects (subscribing from its positions).</summary>
     public const int ExpiredCloseCode = 4401;
+
+    /// <summary>The client didn't take what was sent for too long: it reconnects (subscribing from its positions).</summary>
+    public const int SlowCloseCode = 4408;
 
     public static IServiceCollection AddWincheRealtimeWsApi(this IServiceCollection services, Action<RealtimeSocketOptions>? configure = null)
     {
@@ -66,7 +78,16 @@ public static class RealtimeSocketExtensions
 internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<string, object?>? caller, RealtimeLists lists,
     RealtimeChannels channels, RealtimePresence presence, RealtimeSocketOptions options, ILogger log)
 {
-    private readonly Channel<string> _out = Channel.CreateBounded<string>(new BoundedChannelOptions(options.SendQueueLimit) { SingleReader = true });
+    private readonly Channel<byte[]> _out = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
+    private readonly object _gate = new();
+    private long _queued;
+    private TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private WebSocketCloseStatus _closeCode = WebSocketCloseStatus.NormalClosure;
+    private string _closeWhy = "bye";
+    /// <summary>One subscription reads a page at a time: what a connection holds stays near its queue.</summary>
+    internal SemaphoreSlim Producing { get; } = new(1, 1);
+    /// <summary>The bytes of frames waiting to go out.</summary>
+    internal long QueuedBytes { get { lock (_gate) return _queued; } }
     private readonly Dictionary<string, IDisposable> _subscriptions = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _closing = new();
     private readonly string _id = Guid.NewGuid().ToString("N");
@@ -80,10 +101,8 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(aborted, _closing.Token);
         var ct = linked.Token;
         var writing = WriteAsync(ct);
-        var closeCode = WebSocketCloseStatus.NormalClosure;
-        var closeWhy = "bye";
         using var expiry = ExpiresIn() is { } left ? new CancellationTokenSource(left) : null;
-        using var expired = expiry?.Token.Register(() => { closeCode = (WebSocketCloseStatus)RealtimeSocketExtensions.ExpiredCloseCode; closeWhy = "sign-in expired"; _closing.Cancel(); });
+        using var expired = expiry?.Token.Register(() => Close(RealtimeSocketExtensions.ExpiredCloseCode, "sign-in expired"));
         try
         {
             await SendAsync(new JsonObject { ["type"] = "welcome", ["connectionId"] = _id }, ct);
@@ -101,7 +120,7 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
             try { await writing; } catch { /* gone */ }
             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
-                try { await socket.CloseAsync(closeCode, closeWhy, CancellationToken.None); } catch { /* gone */ }
+                try { await socket.CloseAsync(_closeCode, _closeWhy, CancellationToken.None); } catch { /* gone */ }
             }
         }
     }
@@ -194,8 +213,8 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
 
     private async Task<JsonObject> ReadAsync(JsonObject frame, CancellationToken ct)
     {
-        var page = await lists.ReadAsync(caller, Path(frame), After(frame), frame["limit"] is JsonValue l && l.TryGetValue<int>(out var limit) ? limit : 500, ct);
-        return new JsonObject { ["items"] = Items(page.Items), ["list"] = page.List is null ? null : List(page.List) };
+        var page = await lists.ReadAsync(caller, Path(frame), After(frame), frame["limit"] is JsonValue l && l.TryGetValue<int>(out var limit) ? limit : 500, options.FrameBytes, ct);
+        return new JsonObject { ["items"] = Items(page.Items), ["list"] = page.List is null ? null : List(page.List), ["more"] = page.More };
     }
 
     private async Task<JsonObject> SubscribeAsync(JsonObject frame, string? id, CancellationToken ct)
@@ -248,11 +267,11 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         var channel = ChannelOf(frame);
         await channels.CanListenAsync(caller, path, channel, ct);
         var name = id ?? Guid.NewGuid().ToString("N");
-        Hold(name, channels.Listen(path, channel, m => _out.Writer.TryWrite(new JsonObject
+        Hold(name, channels.Listen(path, channel, m => TryEnqueue(new JsonObject
         {
             ["type"] = "message", ["subscription"] = name, ["path"] = m.Path, ["channel"] = m.Channel, ["by"] = m.By,
             ["at"] = m.At.ToString("O"), ["payload"] = Convert.ToBase64String(m.Payload),
-        }.ToJsonString())));
+        })));
         return new JsonObject { ["subscription"] = name };
     }
 
@@ -372,13 +391,21 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
             {
                 while (!ct.IsCancellationRequested)
                 {
-                    var page = await connection.Lists.Store.ReadAsync(path, last, connection.Options.ItemsPerFrame, ct);
-                    if (page.Items.Count > 0)
+                    RealtimePage page;
+                    await connection.Producing.WaitAsync(ct);
+                    try
                     {
-                        last = page.Items[^1].Position;
-                        await connection.SendAsync(new JsonObject { ["type"] = "items", ["subscription"] = name, ["path"] = path, ["items"] = Items(page.Items) }, ct);
-                        if (page.Items.Count == connection.Options.ItemsPerFrame) continue;   // more to catch up
+                        // Room for a page first, then read it: a slow client holds its queue and one page, no more.
+                        await connection.RoomAsync(connection.Options.FrameBytes, reserve: false, ct);
+                        page = await connection.Lists.Store.ReadAsync(path, last, connection.Options.ItemsPerFrame, connection.Options.FrameBytes, ct);
+                        if (page.Items.Count > 0)
+                        {
+                            last = page.Items[^1].Position;
+                            await connection.SendAsync(new JsonObject { ["type"] = "items", ["subscription"] = name, ["path"] = path, ["items"] = Items(page.Items) }, ct);
+                        }
                     }
+                    finally { connection.Producing.Release(); }
+                    if (page.More) continue;   // more to catch up
                     if (page.List is { } list && list.State != state)
                     {
                         state = list.State;
@@ -404,12 +431,86 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         }
     }
 
-    private async Task SendAsync(JsonObject frame, CancellationToken ct) => await _out.Writer.WriteAsync(frame.ToJsonString(), ct);
+    /// <summary>Queues a frame, waiting while the queue is full; closes the connection as too slow if it stays full.</summary>
+    private async Task SendAsync(JsonObject frame, CancellationToken ct)
+    {
+        var bytes = Encoding.UTF8.GetBytes(frame.ToJsonString());
+        await RoomAsync(bytes.Length, reserve: true, ct);
+        if (!_out.Writer.TryWrite(bytes)) Sent(bytes.Length);   // closing: nothing goes out
+    }
+
+    /// <summary>Queues a frame if there's room now, else drops it (a channel message: live only).</summary>
+    private void TryEnqueue(JsonObject frame)
+    {
+        var bytes = Encoding.UTF8.GetBytes(frame.ToJsonString());
+        lock (_gate)
+        {
+            if (_queued > 0 && _queued + bytes.Length > options.SendQueueBytes) return;
+            _queued += bytes.Length;
+        }
+        if (!_out.Writer.TryWrite(bytes)) Sent(bytes.Length);
+    }
+
+    /// <summary>
+    /// Waits until <paramref name="bytes"/> more fit in the queue (always, when it's empty), and takes them if
+    /// <paramref name="reserve"/>. A queue that stays full for <see cref="RealtimeSocketOptions.SlowClientTimeout"/> closes the connection.
+    /// </summary>
+    internal async Task RoomAsync(long bytes, bool reserve, CancellationToken ct)
+    {
+        var until = DateTimeOffset.UtcNow + options.SlowClientTimeout;
+        while (true)
+        {
+            Task drained;
+            lock (_gate)
+            {
+                if (_queued == 0 || _queued + bytes <= options.SendQueueBytes)
+                {
+                    if (reserve) _queued += bytes;
+                    return;
+                }
+                drained = _drained.Task;
+            }
+            var left = until - DateTimeOffset.UtcNow;
+            if (left <= TimeSpan.Zero)
+            {
+                Close(RealtimeSocketExtensions.SlowCloseCode, "too slow: reconnect and read on from your positions");
+                throw new OperationCanceledException();
+            }
+            await Task.WhenAny(drained, Task.Delay(left, ct));
+            ct.ThrowIfCancellationRequested();
+        }
+    }
+
+    private void Sent(long bytes)
+    {
+        TaskCompletionSource drained;
+        lock (_gate)
+        {
+            _queued -= bytes;
+            drained = _drained;
+            _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        drained.TrySetResult();
+    }
+
+    private void Close(int code, string why)
+    {
+        lock (_gate)
+        {
+            if (_closing.IsCancellationRequested) return;
+            _closeCode = (WebSocketCloseStatus)code;
+            _closeWhy = why;
+        }
+        _closing.Cancel();
+    }
 
     private async Task WriteAsync(CancellationToken ct)
     {
-        await foreach (var text in _out.Reader.ReadAllAsync(ct))
-            await socket.SendAsync(Encoding.UTF8.GetBytes(text), WebSocketMessageType.Text, true, ct);
+        await foreach (var bytes in _out.Reader.ReadAllAsync(ct))
+        {
+            await socket.SendAsync(bytes, WebSocketMessageType.Text, true, ct);
+            Sent(bytes.Length);
+        }
     }
 
     private static string Path(JsonObject frame) =>

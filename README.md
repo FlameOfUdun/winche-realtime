@@ -122,7 +122,10 @@ for the next sweep; nothing is deleted unarchived. Without an archive, lists are
 
 `WincheRealtimeOptions`: `MaxItemBytes` (64 KB), `MaxBatchItems` (500), `MaxListItems` (200,000), `MaxListBytes`
 (50 MB), `MaxKeyLength` (200). `RealtimeSocketOptions`: `MaxFrameBytes` (4 MB), `MaxSubscriptions` (100),
-`SendQueueLimit` (256), `ItemsPerFrame` (500). A slow reader slows its own subscription down; it never loses items.
+`SendQueueBytes` (8 MB), `FrameBytes` (1 MB of payloads per frame, always at least one item), `ItemsPerFrame` (500),
+`SlowClientTimeout` (30 s). A slow reader slows its own subscriptions down and never loses items; one whose queue
+stays full for the timeout is closed with code **4408** and reconnects, subscribing from its positions. A `read`
+answers with `more: true` when the page stopped at its byte budget.
 
 ## License
 

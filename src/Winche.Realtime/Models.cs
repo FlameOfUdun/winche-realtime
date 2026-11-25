@@ -14,7 +14,11 @@ public sealed record RealtimeListInfo(string Path, string State, long Count, lon
 }
 
 /// <summary>A page of a list: items after a position, and the list (null when there's none at the path).</summary>
-public sealed record RealtimePage(IReadOnlyList<RealtimeItem> Items, RealtimeListInfo? List);
+public sealed record RealtimePage(IReadOnlyList<RealtimeItem> Items, RealtimeListInfo? List)
+{
+    /// <summary>Whether there are items after these (the page stopped at its limit or its byte budget).</summary>
+    public bool More { get; init; }
+}
 
 /// <summary>Why Realtime refused: a shared error code, and a sentence.</summary>
 public sealed class RealtimeException(WincheErrorCode code, string message, string? reason = null) : Exception(message)
