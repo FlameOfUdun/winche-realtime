@@ -170,6 +170,30 @@ public class SocketTests(PostgresFixture pg)
     }
 
     [Fact]
+    public async Task Followers_catch_up_after_their_server_loses_Postgres_for_a_moment()
+    {
+        var database = await pg.NewDatabaseAsync();
+        await using var one = await StartAsync(database);
+        await using var two = await StartAsync(database);
+        await using var ann = await ConnectAsync(one, "ann");
+        await using var bob = await ConnectAsync(two, "bob");
+        await ann.RequestAsync(Append("sessions/s1", "ann:1"));
+        var subscription = (string)(await bob.RequestAsync(new JsonObject { ["type"] = "subscribe", ["path"] = "sessions/s1", ["after"] = 1 }))["result"]!["subscription"]!;
+        await Task.Delay(500);   // both servers listening
+
+        // Postgres drops the servers' listening connections; an append lands while they're away.
+        await using (var conn = new Npgsql.NpgsqlConnection(database))
+        {
+            await conn.OpenAsync();
+            await using var kill = new Npgsql.NpgsqlCommand("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'LISTEN%'", conn);
+            await kill.ExecuteNonQueryAsync();
+        }
+        await ann.RequestAsync(Append("sessions/s1", "ann:2"));
+        var items = await bob.WaitForAsync(f => (string?)f["type"] == "items" && (string?)f["subscription"] == subscription);
+        Assert.Equal("ann:2", (string?)items["items"]![0]!["key"]);
+    }
+
+    [Fact]
     public async Task On_a_real_server_an_expired_sign_in_closes_with_4401()
     {
         await using var app = await StartAsync(kestrel: true);

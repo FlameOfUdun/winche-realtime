@@ -36,6 +36,20 @@ public sealed class RealtimeNotifier
         }
     }
 
+    /// <summary>
+    /// Every path may have changed (the relay was away from Postgres and missed what other servers said): wakes every
+    /// watcher, which reads on from where it is.
+    /// </summary>
+    public void ChangedAll()
+    {
+        foreach (var those in _watchers.Values)
+            foreach (var watcher in those.Values)
+            {
+                try { watcher(0); }
+                catch { /* a watcher's own failure is its own */ }
+            }
+    }
+
     private sealed class Unwatch(Action undo) : IDisposable
     {
         private int _done;
