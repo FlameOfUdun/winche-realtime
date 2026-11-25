@@ -28,7 +28,7 @@ public class BackpressureTests(PostgresFixture pg)
     [Fact]
     public async Task A_client_that_stops_reading_is_held_to_its_queue_then_closed_as_too_slow()
     {
-        var services = Microsoft.Extensions.DependencyInjection.LoggingServiceCollectionExtensions.AddLogging(new Microsoft.Extensions.DependencyInjection.ServiceCollection())
+        await using var services = Microsoft.Extensions.DependencyInjection.LoggingServiceCollectionExtensions.AddLogging(new Microsoft.Extensions.DependencyInjection.ServiceCollection())
             .AddWincheRealtime(o => { o.ConnectionString = pg.NewDatabaseAsync().GetAwaiter().GetResult(); o.UseRulesText("match sessions/{s} { allow get: if request.auth != null; }"); })
             .BuildServiceProvider();
         T Get<T>() where T : notnull => Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions.GetRequiredService<T>(services);

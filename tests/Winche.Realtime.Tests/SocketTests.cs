@@ -157,6 +157,18 @@ public class SocketTests(PostgresFixture pg)
         Assert.Equal((WebSocketCloseStatus)4401, ann.CloseStatus);
     }
 
+    [Theory]
+    [InlineData(60 * 24 * 3600L)]            // 60 days: past what one .NET timer can wait
+    [InlineData(long.MaxValue / 2)]          // past any date
+    public async Task A_sign_in_that_lasts_long_still_connects_and_works(long seconds)
+    {
+        await using var app = await StartAsync();
+        var exp = seconds > 1L << 40 ? seconds : DateTimeOffset.UtcNow.ToUnixTimeSeconds() + seconds;
+        await using var ann = await ConnectAsync(app, $"ann,exp={exp}");
+        var appended = await ann.RequestAsync(Append("sessions/s1", "ann:1"));
+        Assert.Equal(1L, (long)appended["result"]!["positions"]![0]!);
+    }
+
     [Fact]
     public async Task On_a_real_server_an_expired_sign_in_closes_with_4401()
     {

@@ -105,8 +105,7 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(aborted, _closing.Token);
         var ct = linked.Token;
         var writing = WriteAsync(ct);
-        using var expiry = ExpiresIn() is { } left ? new CancellationTokenSource(left) : null;
-        using var expired = expiry?.Token.Register(() => Close(RealtimeSocketExtensions.ExpiredCloseCode, "sign-in expired"));
+        if (ExpiresAt() is { } at) _ = ExpireAsync(at, ct);
         try
         {
             await SendAsync(new JsonObject { ["type"] = "welcome", ["connectionId"] = _id }, ct);
@@ -130,12 +129,37 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         }
     }
 
-    /// <summary>How long the caller's sign-in has left (its token's exp), or null when it doesn't say.</summary>
-    private TimeSpan? ExpiresIn()
+    /// <summary>When the caller's sign-in expires (its token's exp), or null when it doesn't say or says something that isn't a date.</summary>
+    private DateTimeOffset? ExpiresAt()
     {
-        if (caller?.GetValueOrDefault("exp") is not { } exp) return null;
-        long? at = exp switch { long l => l, int i => i, double d => (long)d, JsonElement { ValueKind: JsonValueKind.Number } e => e.GetInt64(), _ => null };
-        return at is null ? null : TimeSpan.FromSeconds(Math.Max(0, at.Value - DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
+        try
+        {
+            long? at = caller?.GetValueOrDefault("exp") switch
+            {
+                long l => l, int i => i, double d when double.IsFinite(d) => (long)Math.Clamp(d, long.MinValue, long.MaxValue),
+                JsonElement { ValueKind: JsonValueKind.Number } e when e.TryGetInt64(out var n) => n, _ => null,
+            };
+            if (at is null) return null;
+            return at.Value >= DateTimeOffset.MaxValue.ToUnixTimeSeconds() ? null   // after any date: as good as none
+                : DateTimeOffset.FromUnixTimeSeconds(Math.Max(0, at.Value));
+        }
+        catch (ArgumentOutOfRangeException) { return null; }
+    }
+
+    /// <summary>Closes with 4401 when the sign-in expires: waits in steps a .NET timer can take (24 days at most).</summary>
+    private async Task ExpireAsync(DateTimeOffset at, CancellationToken ct)
+    {
+        try
+        {
+            while (true)
+            {
+                var left = at - DateTimeOffset.UtcNow;
+                if (left <= TimeSpan.Zero) break;
+                await Task.Delay(left < TimeSpan.FromDays(24) ? left : TimeSpan.FromDays(24), ct);
+            }
+            Close(RealtimeSocketExtensions.ExpiredCloseCode, "sign-in expired");
+        }
+        catch (OperationCanceledException) { }
     }
 
     private async Task ReceiveAsync(CancellationToken ct)
