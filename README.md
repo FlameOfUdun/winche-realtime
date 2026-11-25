@@ -132,17 +132,19 @@ Members are kept in `winche_realtime_presence`, with each server checking in eve
 
 `UseArchive(IRealtimeArchive)` gives the sweep somewhere to put each list before it's deleted: one gzipped NDJSON
 file (an item a line, in order: `key`, `position`, `at`, `by`, `payload` in base64), named
-`RealtimeArchives.FileName(path)` (`{path}/archive.ndjson.gz`) if you want a name. A list the archive can't take stays
-for the next sweep; nothing is deleted unarchived. Without an archive, lists are simply deleted.
+`RealtimeArchives.FileName(list)` (`{path}/{closed at}.ndjson.gz`, a `:` written `~`) if you want a name. A list the
+archive can't take is kept and tried again an hour later; nothing is deleted unarchived, and with archiving on but no
+archive, closed lists are kept. Without archiving, they're simply deleted.
 
 ## Limits
 
 `WincheRealtimeOptions`: `MaxItemBytes` (64 KB), `MaxBatchItems` (500), `MaxListItems` (200,000), `MaxListBytes`
-(50 MB), `MaxKeyLength` (200). `RealtimeSocketOptions`: `MaxFrameBytes` (4 MB), `MaxSubscriptions` (100),
+(50 MB), `MaxKeyLength` (200). `RealtimeSocketOptions`: `MaxFrameBytes` (4 MB), `MaxSubscriptions` (100), `MaxJoins` (100),
 `SendQueueBytes` (8 MB), `FrameBytes` (1 MB of payloads per frame, always at least one item), `ItemsPerFrame` (500),
 `SlowClientTimeout` (30 s). A slow reader slows its own subscriptions down and never loses items; one whose queue
 stays full for the timeout is closed with code **4408** and reconnects, subscribing from its positions. A `read`
-answers with `more: true` when the page stopped at its byte budget.
+answers with `more: true` when the page stopped at its byte budget. When a followed list is deleted, its subscription sends `state: "deleted"`; a list made at
+the path later is followed from position 1.
 
 ## License
 

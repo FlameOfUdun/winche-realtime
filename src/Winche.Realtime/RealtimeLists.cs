@@ -88,7 +88,8 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
     /// <inheritdoc cref="ServerAppendAsync"/>
     public async Task<RealtimeListInfo> ServerCloseAsync(string path, CancellationToken ct = default)
     {
-        var list = await Store.CloseAsync(path, ct);
+        var (list, closed) = await Store.CloseOnceAsync(path, ct);
+        if (!closed) return list;   // closed already: told then
         Notifier.Changed(path, list.Count);
         if (changes is not null) await changes.ClosedAsync(list, ct);
         return list;
@@ -99,7 +100,8 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
     {
         RealtimeStore.CheckPath(path);
         await RequireAsync(RuleOperation.Update, "close", path, caller, await Store.InfoAsync(path, ct), null, ct);
-        var list = await Store.CloseAsync(path, ct);
+        var (list, closed) = await Store.CloseOnceAsync(path, ct);
+        if (!closed) return list;   // closed already: told then
         Notifier.Changed(path, list.Count);
         if (changes is not null) await changes.ClosedAsync(list, ct);
         return list;

@@ -239,26 +239,35 @@ public sealed class RealtimeStore : IAsyncDisposable
     }
 
     /// <summary>Closes the list at <paramref name="path"/>: it takes no more items, and still reads.</summary>
-    public async Task<RealtimeListInfo> CloseAsync(string path, CancellationToken ct = default)
+    public async Task<RealtimeListInfo> CloseAsync(string path, CancellationToken ct = default) => (await CloseOnceAsync(path, ct)).List;
+
+    /// <summary>As <see cref="CloseAsync"/>, and whether this call closed it (false: it was closed already).</summary>
+    internal async Task<(RealtimeListInfo List, bool Closed)> CloseOnceAsync(string path, CancellationToken ct = default)
     {
         CheckPath(path);
         await EnsureAsync(ct);
         await using var conn = await _db.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
-        RealtimeListInfo list;
+        RealtimeListInfo? list;
         await using (var cmd = new NpgsqlCommand($"""
-            UPDATE {Lists} SET state = 'closed', closed_at = COALESCE(closed_at, $2) WHERE path = $1
+            UPDATE {Lists} SET state = 'closed', closed_at = $2 WHERE path = $1 AND state <> 'closed'
             RETURNING path, state, count, bytes, opened_at, closed_at
             """, conn, tx))
         {
             cmd.Parameters.Add(new() { Value = path });
             cmd.Parameters.Add(new() { Value = _options.Time.GetUtcNow() });
             await using var r = await cmd.ExecuteReaderAsync(ct);
-            list = await r.ReadAsync(ct) ? Info(r) : throw new RealtimeException(WincheErrorCode.NotFound, $"There's no list at {path}.");
+            list = await r.ReadAsync(ct) ? Info(r) : null;
+        }
+        if (list is null)
+        {
+            await tx.RollbackAsync(ct);
+            // Closed already (as it was), or no list at all.
+            return (await InfoAsync(path, ct) ?? throw new RealtimeException(WincheErrorCode.NotFound, $"There's no list at {path}."), false);
         }
         await AnnounceAsync(conn, tx, path, list.Count, ct);
         await tx.CommitAsync(ct);
-        return list;
+        return (list, true);
     }
 
     /// <summary>Lists in path order, after <paramref name="afterPath"/>: those under <paramref name="prefix"/>, in <paramref name="state"/> (open, closed).</summary>
@@ -284,9 +293,7 @@ public sealed class RealtimeStore : IAsyncDisposable
     public async Task<bool> DeleteClosedAsync(string path, CancellationToken ct = default)
     {
         CheckPath(path);
-        if ((await InfoAsync(path, ct))?.State != "closed") return false;
-        await DeleteAsync(path, ct);
-        return true;
+        return await DeleteAsync(path, ct);
     }
 
     // ── the sweep's ─────────────────────────────────────────────────────────────
@@ -316,7 +323,6 @@ public sealed class RealtimeStore : IAsyncDisposable
         return closed;
     }
 
-    /// <summary>Closed lists closed before <paramref name="before"/>: due for archiving and deleting.</summary>
     /// <summary>Closed lists due to go: closed before <paramref name="before"/>, and not failing to archive since <paramref name="retryBefore"/>.</summary>
     internal async Task<IReadOnlyList<RealtimeListInfo>> ExpiredAsync(DateTimeOffset before, DateTimeOffset retryBefore, int limit, CancellationToken ct)
     {
@@ -335,7 +341,6 @@ public sealed class RealtimeStore : IAsyncDisposable
         return due;
     }
 
-    /// <summary>Deletes a closed list and its items.</summary>
     /// <summary>The archive couldn't take the list at <paramref name="path"/>: it waits before it's tried again.</summary>
     internal async Task ArchiveFailedAsync(string path, DateTimeOffset at, CancellationToken ct)
     {
@@ -345,21 +350,28 @@ public sealed class RealtimeStore : IAsyncDisposable
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    internal async Task DeleteAsync(string path, CancellationToken ct)
+    /// <summary>
+    /// Deletes the list at <paramref name="path"/> and its items, if it's closed (one opened again meanwhile stays, items
+    /// and all); its followers are told. Whether it was deleted.
+    /// </summary>
+    internal async Task<bool> DeleteAsync(string path, CancellationToken ct)
     {
+        await EnsureAsync(ct);
         await using var conn = await _db.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
+        await using (var list = new NpgsqlCommand($"DELETE FROM {Lists} WHERE path = $1 AND state = 'closed'", conn, tx))
+        {
+            list.Parameters.Add(new() { Value = path });
+            if (await list.ExecuteNonQueryAsync(ct) == 0) return false;   // rolled back: nothing to delete
+        }
         await using (var items = new NpgsqlCommand($"DELETE FROM {Items} WHERE path = $1", conn, tx))
         {
             items.Parameters.Add(new() { Value = path });
             await items.ExecuteNonQueryAsync(ct);
         }
-        await using (var list = new NpgsqlCommand($"DELETE FROM {Lists} WHERE path = $1 AND state = 'closed'", conn, tx))
-        {
-            list.Parameters.Add(new() { Value = path });
-            await list.ExecuteNonQueryAsync(ct);
-        }
+        await AnnounceAsync(conn, tx, path, 0, ct);
         await tx.CommitAsync(ct);
+        return true;
     }
 
     /// <summary>Announces the path's change to every server (delivered when the transaction commits).</summary>
@@ -396,9 +408,8 @@ public sealed class RealtimeStore : IAsyncDisposable
 
     private static bool Same(byte[] a, byte[] b) => CryptographicOperations.FixedTimeEquals(a, b);
 
-    /// <summary>A path: segments of letters, digits, <c>-</c>, <c>_</c>, <c>.</c>, <c>:</c> and <c>@</c>, separated by single slashes.</summary>
     /// <summary>
-    /// A path: segments of letters, digits, - _ . : @. Never the words <c>channels</c> or <c>presence</c>: rules see a
+    /// A path: segments of letters, digits, - _ . : @, none starting with '.'. Never the words <c>channels</c> or <c>presence</c>: rules see a
     /// path's channels at <c>{path}/channels/{channel}</c> and its presence at <c>{path}/presence</c>, and no list may land there.
     /// </summary>
     internal static void CheckPath(string path)
@@ -410,6 +421,9 @@ public sealed class RealtimeStore : IAsyncDisposable
         if (path.Split('/').Any(s => s is "channels" or "presence"))
             throw new RealtimeException(WincheErrorCode.InvalidArgument, $"'{path}': 'channels' and 'presence' aren't used in paths (rules see a path's channels at {{path}}/channels/… and its presence at {{path}}/presence).");
     }
+
+    /// <summary>Refuses items an append would refuse (keys, sizes, how many): checked before they're kept for later.</summary>
+    internal void CheckItems(IReadOnlyList<RealtimeItemIn> items) => CheckBatch(items);
 
     private void CheckBatch(IReadOnlyList<RealtimeItemIn> items)
     {

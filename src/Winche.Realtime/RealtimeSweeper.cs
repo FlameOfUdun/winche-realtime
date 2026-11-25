@@ -96,6 +96,14 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
         int archived = 0, deleted = 0, failed = 0;
         foreach (var list in await store.ExpiredAsync(now - options.RetainClosedFor, now - RealtimeArchives.RetryAfter, Batch, token))
         {
+            if (options.ArchiveClosedLists && options.Archive is null)
+            {
+                // Archiving asked for with nowhere to archive to: kept, never deleted unarchived.
+                failed++;
+                await store.ArchiveFailedAsync(list.Path, now, token);
+                _log.LogWarning("Realtime keeps {Path}: archiving closed lists is on, but there's no archive.", list.Path);
+                continue;
+            }
             if (options.Archive is { } archive && options.ArchiveClosedLists)
             {
                 try
@@ -112,7 +120,7 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
                     continue;
                 }
             }
-            await store.DeleteAsync(list.Path, token);
+            if (!await store.DeleteAsync(list.Path, token)) continue;   // opened again meanwhile: kept
             deleted++;
             _log.LogInformation("Realtime deleted {Path} ({Count} items), closed {Days:0} days ago.", list.Path, list.Count, (now - list.ClosedAt!.Value).TotalDays);
         }

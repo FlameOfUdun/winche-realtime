@@ -62,11 +62,12 @@ public sealed class RealtimeChannels(RealtimeLists lists, RealtimeNode node, Win
         // Checked before it goes anywhere: delivered on every server or on none.
         if (System.Text.Encoding.UTF8.GetByteCount(wire) > MaxNotificationBytes)
             throw new RealtimeException(WincheErrorCode.InvalidArgument, "The message is too big to cross servers: make it smaller (about 5 KB at most, less with a long path).");
-        Deliver(message);
+        // Through Postgres first: if that fails, the publish fails and no one here has it either.
         await using var cmd = lists.Store.DataSource.CreateCommand("SELECT pg_notify($1, $2)");
         cmd.Parameters.Add(new() { Value = Channel });
         cmd.Parameters.Add(new() { Value = wire });
         await cmd.ExecuteNonQueryAsync(ct);
+        Deliver(message);
     }
 
     /// <summary>Whether the caller may listen: refused with a <see cref="RealtimeException"/> if not.</summary>

@@ -11,6 +11,10 @@ public sealed class TestClient : IAsyncDisposable
 {
     private readonly WebSocket _socket;
     private readonly List<JsonObject> _inbox = [];
+    private readonly List<JsonObject> _all = [];
+
+    /// <summary>Every frame received so far, in the order it came.</summary>
+    public List<JsonObject> Received { get { lock (_inbox) return [.. _all]; } }
     private readonly SemaphoreSlim _signal = new(0);
     private readonly Task _receiving;
     private int _next;
@@ -79,7 +83,8 @@ public sealed class TestClient : IAsyncDisposable
                     if (r.MessageType == WebSocketMessageType.Close) { CloseStatus = r.CloseStatus; return; }
                     message.Write(buffer, 0, r.Count);
                 } while (!r.EndOfMessage);
-                lock (_inbox) _inbox.Add(JsonNode.Parse(message.ToArray())!.AsObject());
+                var frame = JsonNode.Parse(message.ToArray())!.AsObject();
+                lock (_inbox) { _inbox.Add(frame); _all.Add(frame); }
                 _signal.Release();
             }
         }

@@ -35,7 +35,11 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
         if (json is not null && json.Length > options.MaxPresenceDataBytes)
             throw new RealtimeException(WincheErrorCode.InvalidArgument, $"Presence data is at most {options.MaxPresenceDataBytes} bytes of JSON.");
         await lists.RequireAsync(RuleOperation.Create, "join", $"{path}/presence", caller, null, null, ct);
-        if (onDisconnect is not null) await lists.CanAppendAsync(caller, path, [onDisconnect], ct);
+        if (onDisconnect is not null)
+        {
+            Store.CheckItems([onDisconnect]);   // a key and size an append takes: refused now, not lost at the drop
+            await lists.CanAppendAsync(caller, path, [onDisconnect], ct);
+        }
         await BeatAsync(ct);
         await using var cmd = Store.DataSource.CreateCommand($"""
             INSERT INTO {Members} (connection_id, path, uid, data, on_disconnect_key, on_disconnect_payload, server_id, joined_at)
@@ -68,7 +72,7 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
     public async Task DisconnectedAsync(string connection, CancellationToken ct = default)
     {
         await using var cmd = Store.DataSource.CreateCommand($"""
-            DELETE FROM {Members} WHERE connection_id = $1 RETURNING path, uid, on_disconnect_key, on_disconnect_payload
+            SELECT connection_id, path, uid, on_disconnect_key, on_disconnect_payload FROM {Members} WHERE connection_id = $1
             """);
         cmd.Parameters.Add(new() { Value = connection });
         await GoneAsync(cmd, ct);
@@ -109,11 +113,18 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
     {
         await Store.EnsureAsync(ct);
         await using var cmd = Store.DataSource.CreateCommand($"""
-            WITH dead AS (DELETE FROM {Servers} WHERE seen_at < $1 RETURNING id)
-            DELETE FROM {Members} WHERE server_id IN (SELECT id FROM dead) RETURNING path, uid, on_disconnect_key, on_disconnect_payload
+            SELECT m.connection_id, m.path, m.uid, m.on_disconnect_key, m.on_disconnect_payload
+            FROM {Members} m JOIN {Servers} s ON s.id = m.server_id WHERE s.seen_at < $1
             """);
         cmd.Parameters.Add(new() { Value = before });
-        return await GoneAsync(cmd, ct);
+        var gone = await GoneAsync(cmd, ct);
+        // The servers go once their members have (a server that checked in meanwhile stays).
+        await using var servers = Store.DataSource.CreateCommand($"""
+            DELETE FROM {Servers} s WHERE s.seen_at < $1 AND NOT EXISTS (SELECT 1 FROM {Members} m WHERE m.server_id = s.id)
+            """);
+        servers.Parameters.Add(new() { Value = before });
+        await servers.ExecuteNonQueryAsync(ct);
+        return gone;
     }
 
     /// <summary>For tests: a member on another server, as it last checked in.</summary>
@@ -142,15 +153,19 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
         await AnnounceAsync(path, default);
     }
 
-    /// <summary>Members a statement removed: their on-disconnect items appended (as them), every path told.</summary>
-    private async Task<int> GoneAsync(NpgsqlCommand delete, CancellationToken ct)
+    /// <summary>
+    /// Members a query found gone: their on-disconnect items appended (as them) first, then they're removed, every path
+    /// told. A failure on the way leaves them to be tried again: the items' keys stop a second copy.
+    /// </summary>
+    private async Task<int> GoneAsync(NpgsqlCommand select, CancellationToken ct)
     {
         await Store.EnsureAsync(ct);
-        var gone = new List<(string Path, string? Uid, string? Key, byte[]? Payload)>();
-        await using (var r = await delete.ExecuteReaderAsync(ct))
+        var gone = new List<(string Connection, string Path, string? Uid, string? Key, byte[]? Payload)>();
+        await using (var r = await select.ExecuteReaderAsync(ct))
             while (await r.ReadAsync(ct))
-                gone.Add((r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1), r.IsDBNull(2) ? null : r.GetString(2), r.IsDBNull(3) ? null : (byte[])r[3]));
-        foreach (var (path, uid, key, payload) in gone)
+                gone.Add((r.GetString(0), r.GetString(1), r.IsDBNull(2) ? null : r.GetString(2), r.IsDBNull(3) ? null : r.GetString(3), r.IsDBNull(4) ? null : (byte[])r[4]));
+        if (gone.Count == 0) return 0;
+        foreach (var (_, path, uid, key, payload) in gone)
         {
             if (key is not null && payload is not null)
             {
@@ -161,6 +176,12 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
                 }
                 catch (RealtimeException e) { _log.LogInformation("Realtime couldn't append {Key} to {Path} as {Uid} left: {Why}", key, path, uid, e.Message); }
             }
+        }
+        await using (var delete = Store.DataSource.CreateCommand($"DELETE FROM {Members} WHERE (connection_id, path) IN (SELECT * FROM unnest($1::text[], $2::text[]))"))
+        {
+            delete.Parameters.Add(new() { Value = gone.Select(g => g.Connection).ToArray() });
+            delete.Parameters.Add(new() { Value = gone.Select(g => g.Path).ToArray() });
+            await delete.ExecuteNonQueryAsync(ct);
         }
         foreach (var path in gone.Select(g => g.Path).Distinct()) await AnnounceAsync(path, ct);
         return gone.Count;

@@ -20,6 +20,9 @@ public sealed class RealtimeSocketOptions
     /// <summary>The most subscriptions one connection may hold. Default 100.</summary>
     public int MaxSubscriptions { get; set; } = 100;
 
+    /// <summary>The most paths one connection may be present at. Default 100.</summary>
+    public int MaxJoins { get; set; } = 100;
+
     /// <summary>
     /// The most a connection's frames waiting to go out may add up to, in bytes. Default 8 MB. When it's full, the
     /// connection's subscriptions wait (they read on from their positions after) and channel messages are dropped.
@@ -93,6 +96,9 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
     /// <summary>The bytes of frames waiting to go out.</summary>
     internal long QueuedBytes { get { lock (_gate) return _queued; } }
     private readonly Dictionary<string, IDisposable> _subscriptions = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _joined = new(StringComparer.Ordinal);
+    private Action? _afterAnswer;
+    internal bool Closing => Volatile.Read(ref _closeRequested);
     private readonly CancellationTokenSource _closing = new();
     private readonly string _id = Guid.NewGuid().ToString("N");
     internal RealtimeLists Lists => lists;
@@ -126,6 +132,7 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
                 using var grace = new CancellationTokenSource(options.CloseGrace);
                 try { await socket.CloseAsync(_closeCode, _closeWhy, grace.Token); } catch { /* gone */ }
             }
+            linked.Cancel();   // what still waits on the connection (its sign-in's expiry) lets go of it
         }
     }
 
@@ -176,7 +183,8 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
                 message.Write(buffer, 0, r.Count);
                 if (message.Length > options.MaxFrameBytes)
                 {
-                    await socket.CloseAsync(WebSocketCloseStatus.MessageTooBig, $"Frames are at most {options.MaxFrameBytes} bytes.", CancellationToken.None);
+                    // Closed as any close is (the writer sends it; a client that doesn't answer is cut off after CloseGrace).
+                    Close((int)WebSocketCloseStatus.MessageTooBig, $"Frames are at most {options.MaxFrameBytes} bytes.");
                     return;
                 }
             } while (!r.EndOfMessage);
@@ -196,9 +204,10 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
     private async Task HandleAsync(JsonObject frame, CancellationToken ct)
     {
         var id = frame["id"]?.GetValueKind() == JsonValueKind.String ? (string?)frame["id"] : null;
+        var type = frame["type"]?.GetValueKind() == JsonValueKind.String ? (string?)frame["type"] : null;
         try
         {
-            var result = (string?)frame["type"] switch
+            var result = type switch
             {
                 "ping" => new JsonObject(),
                 "append" => await AppendAsync(frame, ct),
@@ -216,11 +225,14 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
                     $"'{other}' isn't a request: ping, append, read, subscribe, unsubscribe, open, close, publish, listen, join, leave or watch."),
             };
             await SendAsync(new JsonObject { ["type"] = "response", ["id"] = id, ["result"] = result }, ct);
+            // A subscription starts once its answer is queued: its first items never come before it.
+            if (_afterAnswer is { } start) { _afterAnswer = null; start(); }
         }
-        catch (RealtimeException e) { await SendAsync(Error(id, e), ct); }
+        catch (RealtimeException e) { _afterAnswer = null; await SendAsync(Error(id, e), ct); }
         catch (Exception e) when (e is not OperationCanceledException)
         {
-            var error = WincheError.Unexpected(e, log, "realtime." + ((string?)frame["type"] ?? "frame"), WincheCaller.UidOf(caller));
+            _afterAnswer = null;
+            var error = WincheError.Unexpected(e, log, "realtime." + (type ?? "frame"), WincheCaller.UidOf(caller));
             await SendAsync(new JsonObject { ["type"] = "error", ["id"] = id, ["error"] = JsonSerializer.SerializeToNode(error) }, ct);
         }
     }
@@ -229,11 +241,12 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
     {
         if (frame["items"] is not JsonArray given) throw new RealtimeException(WincheErrorCode.InvalidArgument, "Give items: [{ key, payload }] (payload in base64).");
         var items = new List<RealtimeItemIn>(given.Count);
-        foreach (var node in given)
+        foreach (var element in given)
         {
-            var key = node?["key"]?.GetValueKind() == JsonValueKind.String ? (string)node["key"]! : "";
+            if (element is not JsonObject node) throw new RealtimeException(WincheErrorCode.InvalidArgument, "Each item is { key, payload } (payload in base64).");
+            var key = node["key"]?.GetValueKind() == JsonValueKind.String ? (string)node["key"]! : "";
             byte[] payload;
-            try { payload = Convert.FromBase64String(node?["payload"]?.GetValueKind() == JsonValueKind.String ? (string)node["payload"]! : ""); }
+            try { payload = Convert.FromBase64String(node["payload"]?.GetValueKind() == JsonValueKind.String ? (string)node["payload"]! : ""); }
             catch (FormatException) { throw new RealtimeException(WincheErrorCode.InvalidArgument, $"{key}: payload is base64."); }
             items.Add(new RealtimeItemIn(key, payload));
         }
@@ -257,7 +270,9 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
             if (_subscriptions.Count >= options.MaxSubscriptions)
                 throw new RealtimeException(WincheErrorCode.ResourceExhausted, $"A connection holds at most {options.MaxSubscriptions} subscriptions.");
             if (_subscriptions.ContainsKey(name)) throw new RealtimeException(WincheErrorCode.AlreadyExists, $"There's a subscription {name} already.");
-            _subscriptions[name] = new Subscription(this, name, path, After(frame), list?.State, ct);
+            var subscription = new Subscription(this, name, path, After(frame), list?.State, ct);
+            _subscriptions[name] = subscription;
+            _afterAnswer = subscription.Start;
         }
         return new JsonObject { ["subscription"] = name, ["list"] = list is null ? null : List(list) };
     }
@@ -316,13 +331,20 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
             onDisconnect = new RealtimeItemIn(key, Payload(od));
             if (key.Length == 0) throw new RealtimeException(WincheErrorCode.InvalidArgument, "onDisconnect needs a key and a payload (base64).");
         }
-        await presence.JoinAsync(caller, _id, Path(frame), frame["data"] as JsonObject, onDisconnect, ct);
+        var path = Path(frame);
+        lock (_joined)
+            if (!_joined.Contains(path) && _joined.Count >= options.MaxJoins)
+                throw new RealtimeException(WincheErrorCode.ResourceExhausted, $"A connection is present at {options.MaxJoins} paths at most.");
+        await presence.JoinAsync(caller, _id, path, frame["data"] as JsonObject, onDisconnect, ct);
+        lock (_joined) _joined.Add(path);
         return new JsonObject();
     }
 
     private async Task<JsonObject> LeaveAsync(JsonObject frame, CancellationToken ct)
     {
-        await presence.LeaveAsync(_id, Path(frame), ct);
+        var path = Path(frame);
+        await presence.LeaveAsync(_id, path, ct);
+        lock (_joined) _joined.Remove(path);
         return new JsonObject();
     }
 
@@ -332,9 +354,15 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         var path = Path(frame);
         await presence.CanWatchAsync(caller, path, ct);
         var name = id ?? Guid.NewGuid().ToString("N");
-        var members = await presence.MembersAsync(path, ct);
-        Hold(name, new Watch(this, name, path, Members(members), ct));
-        return new JsonObject { ["subscription"] = name, ["members"] = Members(members) };
+        // Listening for changes before reading who's there: a join in between wakes the watch, which reads again.
+        var watch = new Watch(this, name, path, ct);
+        Hold(name, watch);
+        IReadOnlyList<RealtimeMember> members;
+        try { members = await presence.MembersAsync(path, ct); }
+        catch { Forget(name, watch); throw; }
+        var sent = Members(members);
+        _afterAnswer = () => watch.Start(sent.ToJsonString());
+        return new JsonObject { ["subscription"] = name, ["members"] = sent };
     }
 
     /// <summary>A presence watch: each change re-reads the members (every server's) and sends them if they differ.</summary>
@@ -344,11 +372,20 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         private readonly SemaphoreSlim _changed = new(0, 1);
         private readonly IDisposable _watch;
 
-        public Watch(RealtimeConnection connection, string name, string path, JsonArray sent, CancellationToken ct)
+        private readonly RealtimeConnection _connection;
+        private readonly string _name, _path;
+
+        public Watch(RealtimeConnection connection, string name, string path, CancellationToken ct)
         {
+            (_connection, _name, _path) = (connection, name, path);
             _stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
             _watch = connection.Lists.Notifier.Watch(RealtimePresence.Key(path), _ => { if (_changed.CurrentCount == 0) try { _changed.Release(); } catch (SemaphoreFullException) { } });
-            _ = RunAsync(connection, name, path, sent.ToJsonString(), _stop.Token);
+        }
+
+        /// <summary>Starts after the answer (<paramref name="sent"/>) is queued; a change heard meanwhile is read at once.</summary>
+        public void Start(string sent)
+        {
+            try { _ = RunAsync(_connection, _name, _path, sent, _stop.Token); } catch (ObjectDisposedException) { }
         }
 
         private async Task RunAsync(RealtimeConnection connection, string name, string path, string last, CancellationToken ct)
@@ -365,11 +402,18 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
                 }
             }
             catch (OperationCanceledException) { }
-            catch (Exception e) { connection.Log.LogWarning(e, "Realtime presence watch of {Path} stopped.", path); }
+            catch (Exception e)
+            {
+                connection.Log.LogWarning(e, "Realtime presence watch of {Path} stopped.", path);
+                connection.Forget(name, this);
+            }
         }
+
+        private int _disposed;
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
             _watch.Dispose();
             _stop.Cancel();
             _stop.Dispose();
@@ -390,6 +434,14 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         catch (FormatException) { throw new RealtimeException(WincheErrorCode.InvalidArgument, "payload is base64."); }
     }
 
+    /// <summary>Lets go of a subscription or watch that stopped by itself (if it's still the one held under <paramref name="name"/>).</summary>
+    private void Forget(string name, IDisposable which)
+    {
+        lock (_subscriptions)
+            if (_subscriptions.TryGetValue(name, out var held) && ReferenceEquals(held, which)) _subscriptions.Remove(name);
+        which.Dispose();
+    }
+
     private JsonObject Unsubscribe(JsonObject frame)
     {
         var name = frame["subscription"]?.GetValueKind() == JsonValueKind.String ? (string)frame["subscription"]! : "";
@@ -408,18 +460,29 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         private readonly SemaphoreSlim _changed = new(0, 1);
         private readonly IDisposable _watch;
 
+        private readonly RealtimeConnection _connection;
+        private readonly string _name, _path;
+        private readonly long _after;
+        private readonly string? _state;
+
         public Subscription(RealtimeConnection connection, string name, string path, long after, string? state, CancellationToken ct)
         {
+            (_connection, _name, _path, _after, _state) = (connection, name, path, after, state);
             _stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
             _watch = connection.Lists.Notifier.Watch(path, _ => { if (_changed.CurrentCount == 0) try { _changed.Release(); } catch (SemaphoreFullException) { } });
-            _ = RunAsync(connection, name, path, after, state, _stop.Token);
+        }
+
+        /// <summary>Starts sending, once the subscribe's answer is queued.</summary>
+        public void Start()
+        {
+            try { _ = RunAsync(_connection, _name, _path, _after, _state, _stop.Token); } catch (ObjectDisposedException) { }
         }
 
         private async Task RunAsync(RealtimeConnection connection, string name, string path, long last, string? state, CancellationToken ct)
         {
             try
             {
-                while (!ct.IsCancellationRequested)
+                while (!ct.IsCancellationRequested && !connection.Closing)
                 {
                     RealtimePage page;
                     await connection.Producing.WaitAsync(ct);
@@ -436,7 +499,13 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
                     }
                     finally { connection.Producing.Release(); }
                     if (page.More) continue;   // more to catch up
-                    if (page.List is { } list && list.State != state)
+                    if (page.List is null && state is not null)
+                    {
+                        // The list was deleted: a list made at the path later starts again at position 1.
+                        (state, last) = (null, 0);
+                        await connection.SendAsync(new JsonObject { ["type"] = "state", ["subscription"] = name, ["path"] = path, ["state"] = "deleted", ["count"] = 0 }, ct);
+                    }
+                    else if (page.List is { } list && list.State != state)
                     {
                         state = list.State;
                         await connection.SendAsync(new JsonObject { ["type"] = "state", ["subscription"] = name, ["path"] = path, ["state"] = list.State, ["count"] = list.Count }, ct);
@@ -448,13 +517,17 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
             catch (Exception e)
             {
                 connection.Log.LogWarning(e, "Realtime subscription to {Path} stopped.", path);
+                connection.Forget(name, this);   // no longer held: it doesn't count towards the limit
                 try { await connection.SendAsync(new JsonObject { ["type"] = "error", ["subscription"] = name, ["error"] = JsonSerializer.SerializeToNode(new WincheError(WincheErrorCode.Unavailable, "The subscription stopped: subscribe again from your last position.")) }, CancellationToken.None); }
                 catch { /* gone */ }
             }
         }
 
+        private int _disposed;
+
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
             _watch.Dispose();
             _stop.Cancel();
             _stop.Dispose();
