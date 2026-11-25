@@ -33,7 +33,10 @@ public sealed class WincheRealtimeOptions
     /// <summary>How often the sweep runs (one server at a time). Default a minute.</summary>
     public TimeSpan SweepEvery { get; set; } = TimeSpan.FromMinutes(1);
 
-    /// <summary>The largest message on a channel, in bytes. Default 4 KB (messages cross servers through Postgres).</summary>
+    /// <summary>
+    /// The largest message on a channel, in bytes. Default 4 KB. Messages cross servers through Postgres, which takes
+    /// about 5.5 KB of message at most (less with a long path): a bigger one is refused whatever this says.
+    /// </summary>
     public int MaxMessageBytes { get; set; } = 4 * 1024;
 
     /// <summary>The most JSON a member may say of themselves when they join. Default 1 KB.</summary>

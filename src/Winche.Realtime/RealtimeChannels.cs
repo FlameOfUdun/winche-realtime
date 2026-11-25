@@ -24,6 +24,12 @@ public sealed class RealtimeChannels(RealtimeLists lists, RealtimeNode node, Win
     /// <summary>The Postgres channel messages cross servers on.</summary>
     public const string Channel = "winche_realtime_messages";
 
+    /// <summary>The most a notification carries: Postgres refuses more than 8,000 bytes.</summary>
+    internal const int MaxNotificationBytes = 7900;
+
+    // Base64's + and / as themselves: escaped, each is six characters and a 4 KB message no longer fits.
+    private static readonly System.Text.Json.JsonSerializerOptions Unescaped = new() { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<Guid, Action<RealtimeMessage>>> _listeners = new(StringComparer.Ordinal);
 
     /// <summary>Publishes <paramref name="payload"/>, if the rules allow: delivered here at once, and to other servers through Postgres.</summary>
@@ -49,14 +55,17 @@ public sealed class RealtimeChannels(RealtimeLists lists, RealtimeNode node, Win
     private async Task SendAsync(IReadOnlyDictionary<string, object?>? caller, string path, string channel, byte[] payload, CancellationToken ct)
     {
         var message = new RealtimeMessage(path, channel, payload, WincheCaller.UidOf(caller), options.Time.GetUtcNow());
-        Deliver(message);
         var wire = new JsonObject
         {
             ["o"] = node.Id, ["p"] = path, ["c"] = channel, ["b"] = message.By, ["d"] = Convert.ToBase64String(payload), ["t"] = message.At.ToUnixTimeMilliseconds(),
-        };
+        }.ToJsonString(Unescaped);
+        // Checked before it goes anywhere: delivered on every server or on none.
+        if (System.Text.Encoding.UTF8.GetByteCount(wire) > MaxNotificationBytes)
+            throw new RealtimeException(WincheErrorCode.InvalidArgument, "The message is too big to cross servers: make it smaller (about 5 KB at most, less with a long path).");
+        Deliver(message);
         await using var cmd = lists.Store.DataSource.CreateCommand("SELECT pg_notify($1, $2)");
         cmd.Parameters.Add(new() { Value = Channel });
-        cmd.Parameters.Add(new() { Value = wire.ToJsonString() });
+        cmd.Parameters.Add(new() { Value = wire });
         await cmd.ExecuteNonQueryAsync(ct);
     }
 

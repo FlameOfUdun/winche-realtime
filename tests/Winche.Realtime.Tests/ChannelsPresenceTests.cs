@@ -90,6 +90,34 @@ public class ChannelsPresenceTests(PostgresFixture pg)
     }
 
     [Fact]
+    public async Task A_full_size_message_of_any_bytes_crosses_servers()
+    {
+        var database = await pg.NewDatabaseAsync();
+        await using var one = await StartAsync(database);
+        await using var two = await StartAsync(database);
+        await using var ann = await ConnectAsync(one, "ann");
+        await using var bob = await ConnectAsync(two, "bob");
+        var listening = (string)(await bob.RequestAsync(new() { ["type"] = "listen", ["path"] = "sessions/s1", ["channel"] = "telemetry" }))["result"]!["subscription"]!;
+        await Task.Delay(300);
+        var payload = Convert.ToBase64String(Enumerable.Repeat(new byte[] { 0xFB, 0xEF, 0xBE }, 1365).SelectMany(b => b).ToArray());   // 4,095 bytes: base64 all '+'
+        var sent = await ann.RequestAsync(new() { ["type"] = "publish", ["path"] = "sessions/s1", ["channel"] = "telemetry", ["payload"] = payload });
+        Assert.Equal("response", (string?)sent["type"]);
+        Assert.Equal(payload, (string?)(await bob.WaitForAsync(f => (string?)f["type"] == "message" && (string?)f["subscription"] == listening))["payload"]);
+    }
+
+    [Fact]
+    public async Task A_message_too_big_to_cross_servers_is_refused_and_delivered_nowhere()
+    {
+        await using var one = await StartAsync(configure: o => o.MaxMessageBytes = 64 * 1024);   // set past what fits
+        await using var ann = await ConnectAsync(one, "ann");
+        await using var cat = await ConnectAsync(one, "cat");
+        await cat.RequestAsync(new() { ["type"] = "listen", ["path"] = "sessions/s1", ["channel"] = "telemetry" });
+        var sent = await ann.RequestAsync(new() { ["type"] = "publish", ["path"] = "sessions/s1", ["channel"] = "telemetry", ["payload"] = Convert.ToBase64String(new byte[7000]) });
+        Assert.Equal("invalid-argument", (string?)sent["error"]!["code"]);
+        await cat.AssertSilenceAsync(f => (string?)f["type"] == "message", TimeSpan.FromMilliseconds(500));
+    }
+
+    [Fact]
     public async Task Watchers_see_who_joins_and_leaves_and_a_drop_runs_its_on_disconnect()
     {
         await using var app = await StartAsync();
