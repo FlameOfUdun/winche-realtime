@@ -40,7 +40,7 @@ public class BackpressureTests(PostgresFixture pg)
             socket.Incoming.Writer.TryWrite(new JsonObject { ["type"] = "subscribe", ["id"] = $"s{n}", ["path"] = "sessions/big" }.ToJsonString());
         var connection = new RealtimeConnection(socket, new Dictionary<string, object?> { ["uid"] = "ann" }, Get<RealtimeLists>(),
             Get<RealtimeChannels>(), Get<RealtimePresence>(),
-            new RealtimeSocketOptions { SendQueueBytes = 1_000_000, FrameBytes = 200_000, SlowClientTimeout = TimeSpan.FromSeconds(1) },
+            new RealtimeSocketOptions { SendQueueBytes = 1_000_000, FrameBytes = 200_000, SlowClientTimeout = TimeSpan.FromSeconds(1), CloseGrace = TimeSpan.FromSeconds(1) },
             NullLogger.Instance);
 
         var running = connection.RunAsync(CancellationToken.None);

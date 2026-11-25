@@ -24,11 +24,12 @@ public class SocketTests(PostgresFixture pg)
         """;
 
     /// <summary>A host with Realtime at /realtime/v1/ws; ?access_token=uid[,host][,exp=unix] signs in (none: signed out).</summary>
-    private async Task<WebApplication> StartAsync(string? database = null)
+    private async Task<WebApplication> StartAsync(string? database = null, bool kestrel = false)
     {
         var connection = database ?? await pg.NewDatabaseAsync();
         var builder = WebApplication.CreateBuilder();
-        builder.WebHost.UseTestServer();
+        if (kestrel) builder.WebHost.UseUrls("http://127.0.0.1:0");   // a real server, on a free port
+        else builder.WebHost.UseTestServer();
         builder.Services.AddWincheRealtime(o => { o.ConnectionString = connection; o.UseRulesText(Rules); });
         builder.Services.AddWincheRealtimeWsApi();
         builder.Services.AddWincheCaller(http =>
@@ -154,6 +155,21 @@ public class SocketTests(PostgresFixture pg)
         await using var ann = await ConnectAsync(app, $"ann,exp={soon}");
         await ann.WaitForCloseAsync(TimeSpan.FromSeconds(10));
         Assert.Equal((WebSocketCloseStatus)4401, ann.CloseStatus);
+    }
+
+    [Fact]
+    public async Task On_a_real_server_an_expired_sign_in_closes_with_4401()
+    {
+        await using var app = await StartAsync(kestrel: true);
+        var soon = DateTimeOffset.UtcNow.AddSeconds(2).ToUnixTimeSeconds();
+        using var socket = new ClientWebSocket();
+        await socket.ConnectAsync(new Uri(app.Urls.First().Replace("http", "ws") + $"/realtime/v1/ws?access_token=ann,exp={soon}"), CancellationToken.None);
+        var buffer = new byte[1 << 16];
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        WebSocketReceiveResult r;
+        do r = await socket.ReceiveAsync(buffer, timeout.Token);   // the welcome, then the close
+        while (r.MessageType != WebSocketMessageType.Close);
+        Assert.Equal((WebSocketCloseStatus)RealtimeSocketExtensions.ExpiredCloseCode, socket.CloseStatus);
     }
 
     /// <summary>A frame-level client: send JSON, wait for frames.</summary>

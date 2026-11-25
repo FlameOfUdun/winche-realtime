@@ -32,6 +32,9 @@ public sealed class RealtimeSocketOptions
     /// <summary>How long a connection's queue may stay full before it's closed as too slow (<see cref="RealtimeSocketExtensions.SlowCloseCode"/>). Default 30 s.</summary>
     public TimeSpan SlowClientTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>How long the server waits for the client to answer its close (an expired sign-in, too slow) before it cuts the connection. Default 5 s.</summary>
+    public TimeSpan CloseGrace { get; set; } = TimeSpan.FromSeconds(5);
+
     /// <summary>The most items a subscription sends in one frame. Default 500.</summary>
     public int ItemsPerFrame { get; set; } = 500;
 }
@@ -84,6 +87,7 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
     private TaskCompletionSource _drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private WebSocketCloseStatus _closeCode = WebSocketCloseStatus.NormalClosure;
     private string _closeWhy = "bye";
+    private bool _closeRequested;
     /// <summary>One subscription reads a page at a time: what a connection holds stays near its queue.</summary>
     internal SemaphoreSlim Producing { get; } = new(1, 1);
     /// <summary>The bytes of frames waiting to go out.</summary>
@@ -120,7 +124,8 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
             try { await writing; } catch { /* gone */ }
             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
-                try { await socket.CloseAsync(_closeCode, _closeWhy, CancellationToken.None); } catch { /* gone */ }
+                using var grace = new CancellationTokenSource(options.CloseGrace);
+                try { await socket.CloseAsync(_closeCode, _closeWhy, grace.Token); } catch { /* gone */ }
             }
         }
     }
@@ -152,6 +157,7 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
                 }
             } while (!r.EndOfMessage);
 
+            if (Volatile.Read(ref _closeRequested)) continue;   // closing: only the client's close is awaited
             JsonObject? frame = null;
             try { frame = JsonNode.Parse(message.ToArray()) as JsonObject; } catch (JsonException) { }
             if (frame is null)
@@ -493,24 +499,33 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
         drained.TrySetResult();
     }
 
+    /// <summary>
+    /// Closes with <paramref name="code"/>: the writer drops what's queued and sends the close; the client's answer
+    /// ends the receive loop. Nothing is cancelled at once (cancelling a receive aborts a Kestrel socket, and the close
+    /// would never go out); a client that doesn't answer within <see cref="RealtimeSocketOptions.CloseGrace"/> is cut off.
+    /// </summary>
     private void Close(int code, string why)
     {
         lock (_gate)
         {
-            if (_closing.IsCancellationRequested) return;
+            if (_closeRequested) return;
+            _closeRequested = true;
             _closeCode = (WebSocketCloseStatus)code;
             _closeWhy = why;
         }
-        _closing.Cancel();
+        _out.Writer.TryComplete();
+        try { _closing.CancelAfter(options.CloseGrace); } catch (ObjectDisposedException) { }
     }
 
     private async Task WriteAsync(CancellationToken ct)
     {
         await foreach (var bytes in _out.Reader.ReadAllAsync(ct))
         {
-            await socket.SendAsync(bytes, WebSocketMessageType.Text, true, ct);
+            if (!Volatile.Read(ref _closeRequested)) await socket.SendAsync(bytes, WebSocketMessageType.Text, true, ct);
             Sent(bytes.Length);
         }
+        if (Volatile.Read(ref _closeRequested) && socket.State == WebSocketState.Open)
+            await socket.CloseOutputAsync(_closeCode, _closeWhy, ct);
     }
 
     private static string Path(JsonObject frame) =>
