@@ -81,6 +81,8 @@ public class ChangesTests(PostgresFixture pg)
         clock.Now += TimeSpan.FromMinutes(2);
         await sweeper.RunOnceAsync();
         Assert.Equal(("closed", "sessions/s1"), (Assert.Single(sink.Changes).Type, sink.Changes[0].Path));
+        var info = (await lists.Store.InfoAsync("sessions/s1"))!;
+        Assert.Equal(RealtimeChanges.IdOf(info), sink.Changes[0].Id);   // the id a first try had too: a repeat is recognisable
         await sweeper.RunOnceAsync();
         Assert.Single(sink.Changes);   // once
 

@@ -91,6 +91,9 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
     /// <summary>For tests: how many clean-ups to refuse, as a database error would.</summary>
     internal int CleanupFault;
 
+    /// <summary>For tests: how many ended connections wait to be cleaned up.</summary>
+    internal int UnfinishedCount => _unfinished.Count;
+
     /// <summary>Ended connections whose clean-up failed: tried again at each check-in.</summary>
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _unfinished = new(StringComparer.Ordinal);
 

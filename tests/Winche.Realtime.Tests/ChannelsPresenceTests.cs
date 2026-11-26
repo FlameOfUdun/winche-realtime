@@ -202,15 +202,16 @@ public class ChannelsPresenceTests(PostgresFixture pg)
     {
         await using var one = await StartAsync(configure: o => o.PresenceBeatEvery = TimeSpan.FromHours(1));   // check-ins by hand here
         var presence = one.Services.GetRequiredService<RealtimePresence>();
-        await using var ann = await ConnectAsync(one, "ann");
+        var ann = await ConnectAsync(one, "ann");
         await ann.RequestAsync(new()
         {
             ["type"] = "join", ["path"] = "sessions/s1",
             ["onDisconnect"] = new JsonObject { ["key"] = "ann:left", ["payload"] = B64("left") },
         });
         presence.CleanupFault = 1;   // the database refuses the next clean-up
-        await ann.AbortAsync();
-        for (var i = 0; i < 50 && presence.CleanupFault > 0; i++) await Task.Delay(50);
+        await ann.DisposeAsync();    // the connection ends (without leaving: its on-disconnect item is due)
+        for (var i = 0; i < 300 && presence.UnfinishedCount == 0; i++) await Task.Delay(50);   // its clean-up failed and waits
+        Assert.Equal(1, presence.UnfinishedCount);
         Assert.Single(await presence.MembersAsync("sessions/s1"));   // still there: a ghost for now
 
         await presence.BeatAsync(default);   // the next check-in

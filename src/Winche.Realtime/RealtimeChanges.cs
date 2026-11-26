@@ -14,5 +14,12 @@ public sealed class RealtimeChanges(IEnumerable<IWincheChangeSink> sinks)
         {
             ["path"] = list.Path, ["count"] = list.Count, ["bytes"] = list.Bytes,
             ["openedAt"] = list.OpenedAt.ToString("O"), ["closedAt"] = list.ClosedAt?.ToString("O"),
-        }, null, new Dictionary<string, string> { ["path"] = list.Path }), ct);
+        }, null, new Dictionary<string, string> { ["path"] = list.Path }) { Id = IdOf(list) }, ct);
+
+    /// <summary>
+    /// The same for every time this list's closing is published (a resend after a failure included), so receivers can
+    /// drop a repeat: from its path and when it closed.
+    /// </summary>
+    internal static string IdOf(RealtimeListInfo list) => Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
+        System.Text.Encoding.UTF8.GetBytes($"realtime.closed\n{list.Path}\n{list.ClosedAt?.ToUnixTimeMilliseconds()}")))[..32];
 }
