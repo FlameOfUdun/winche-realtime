@@ -136,6 +136,10 @@ file (an item a line, in order: `key`, `position`, `at`, `by`, `payload` in base
 archive can't take is kept and tried again an hour later; nothing is deleted unarchived, and with archiving on but no
 archive, closed lists are kept. Without archiving, they're simply deleted.
 
+A list closing (by hand, by a function or idle) publishes a `closed` change (source `realtime`) to webhooks and
+functions' `onRealtime.closed`: at least once. One that couldn't be published (the hooks' queue unreachable, the server
+stopping) is sent by a sweep a minute or two later; rarely, one goes out twice, so handlers should be safe to run again.
+
 ## Limits
 
 `WincheRealtimeOptions`: `MaxItemBytes` (64 KB), `MaxBatchItems` (500), `MaxListItems` (200,000), `MaxListBytes`

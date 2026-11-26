@@ -63,6 +63,8 @@ public sealed class RealtimeStore : IAsyncDisposable
         """,
         // A closed list the archive couldn't take: when it last failed (it waits before it's tried again).
         $"ALTER TABLE {Lists} ADD COLUMN IF NOT EXISTS archive_failed_at timestamptz;",
+        // A list closed whose "closed" event isn't out yet: set as it closes, cleared once published (the sweep resends).
+        $"ALTER TABLE {Lists} ADD COLUMN IF NOT EXISTS closed_unannounced boolean NOT NULL DEFAULT false;",
     ];
 
     private readonly WincheRealtimeOptions _options;
@@ -250,7 +252,7 @@ public sealed class RealtimeStore : IAsyncDisposable
         await using var tx = await conn.BeginTransactionAsync(ct);
         RealtimeListInfo? list;
         await using (var cmd = new NpgsqlCommand($"""
-            UPDATE {Lists} SET state = 'closed', closed_at = $2 WHERE path = $1 AND state <> 'closed'
+            UPDATE {Lists} SET state = 'closed', closed_at = $2, closed_unannounced = true WHERE path = $1 AND state <> 'closed'
             RETURNING path, state, count, bytes, opened_at, closed_at
             """, conn, tx))
         {
@@ -304,7 +306,7 @@ public sealed class RealtimeStore : IAsyncDisposable
         await EnsureAsync(ct);
         var closed = new List<RealtimeListInfo>();
         await using var cmd = _db.CreateCommand($"""
-            UPDATE {Lists} SET state = 'closed', closed_at = $2
+            UPDATE {Lists} SET state = 'closed', closed_at = $2, closed_unannounced = true
             WHERE path IN (SELECT path FROM {Lists} WHERE state = 'open' AND COALESCE(last_at, opened_at) < $1 LIMIT $3 FOR UPDATE SKIP LOCKED)
             RETURNING path, state, count, bytes, opened_at, closed_at
             """);
@@ -336,6 +338,30 @@ public sealed class RealtimeStore : IAsyncDisposable
         cmd.Parameters.Add(new() { Value = before });
         cmd.Parameters.Add(new() { Value = limit });
         cmd.Parameters.Add(new() { Value = retryBefore });
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct)) due.Add(Info(r));
+        return due;
+    }
+
+    /// <summary>The list's "closed" event is out (or nothing listens for it).</summary>
+    internal async Task AnnouncedAsync(string path, CancellationToken ct)
+    {
+        await using var cmd = _db.CreateCommand($"UPDATE {Lists} SET closed_unannounced = false WHERE path = $1");
+        cmd.Parameters.Add(new() { Value = path });
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>Lists closed before <paramref name="before"/> whose "closed" event isn't out: the sweep sends it.</summary>
+    internal async Task<IReadOnlyList<RealtimeListInfo>> UnannouncedAsync(DateTimeOffset before, int limit, CancellationToken ct)
+    {
+        await EnsureAsync(ct);
+        var due = new List<RealtimeListInfo>();
+        await using var cmd = _db.CreateCommand($"""
+            SELECT path, state, count, bytes, opened_at, closed_at FROM {Lists}
+            WHERE closed_unannounced AND state = 'closed' AND closed_at < $1 ORDER BY closed_at LIMIT $2
+            """);
+        cmd.Parameters.Add(new() { Value = before });
+        cmd.Parameters.Add(new() { Value = limit });
         await using var r = await cmd.ExecuteReaderAsync(ct);
         while (await r.ReadAsync(ct)) due.Add(Info(r));
         return due;

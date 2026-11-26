@@ -91,7 +91,7 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
         var (list, closed) = await Store.CloseOnceAsync(path, ct);
         if (!closed) return list;   // closed already: told then
         Notifier.Changed(path, list.Count);
-        if (changes is not null) await changes.ClosedAsync(list, ct);
+        await AnnounceClosedAsync(list, ct);
         return list;
     }
 
@@ -103,8 +103,18 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
         var (list, closed) = await Store.CloseOnceAsync(path, ct);
         if (!closed) return list;   // closed already: told then
         Notifier.Changed(path, list.Count);
-        if (changes is not null) await changes.ClosedAsync(list, ct);
+        await AnnounceClosedAsync(list, ct);
         return list;
+    }
+
+    /// <summary>
+    /// Publishes a list's "closed" event, then marks it out. Failing leaves it marked for the sweep to send later, so it
+    /// goes out at least once (rarely twice: published, then the server stopped before marking).
+    /// </summary>
+    internal async Task AnnounceClosedAsync(RealtimeListInfo list, CancellationToken ct)
+    {
+        if (changes is not null) await changes.ClosedAsync(list, ct);
+        await Store.AnnouncedAsync(list.Path, ct);
     }
 
     /// <summary>Whether the caller may append <paramref name="items"/> to <paramref name="path"/>: refused if not (nothing appended).</summary>

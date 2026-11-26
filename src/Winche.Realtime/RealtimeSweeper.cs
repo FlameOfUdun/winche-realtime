@@ -71,6 +71,20 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
     private readonly ILogger _log = log ?? NullLogger.Instance;
     private const int Batch = 200;
 
+    /// <summary>Publishes a list's "closed" event and marks it out; failing, it's left for the next sweep.</summary>
+    private async Task AnnounceAsync(RealtimeListInfo list, CancellationToken ct)
+    {
+        try
+        {
+            if (changes is not null) await changes.ClosedAsync(list, ct);
+            await store.AnnouncedAsync(list.Path, ct);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            _log.LogWarning(e, "Realtime couldn't publish that {Path} closed: the next sweep tries again.", list.Path);
+        }
+    }
+
     /// <summary>Sweeps once: what it did, or null when another server is sweeping.</summary>
     public async Task<RealtimeSweep?> RunOnceAsync(CancellationToken ct = default)
     {
@@ -88,10 +102,15 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
             {
                 closed++;
                 notifier.Changed(list.Path, list.Count);
-                if (changes is not null) await changes.ClosedAsync(list, token);
+                await AnnounceAsync(list, token);
                 _log.LogInformation("Realtime closed {Path}: no item for {Idle}.", list.Path, idle);
             }
         }
+
+        // "Closed" events that didn't go out (the hooks' queue unreachable, the server stopped): sent now. Only those
+        // closed over a minute ago, so a close still publishing its own isn't sent twice.
+        foreach (var list in await store.UnannouncedAsync(now - TimeSpan.FromMinutes(1), Batch, token))
+            await AnnounceAsync(list, token);
 
         int archived = 0, deleted = 0, failed = 0;
         foreach (var list in await store.ExpiredAsync(now - options.RetainClosedFor, now - RealtimeArchives.RetryAfter, Batch, token))
