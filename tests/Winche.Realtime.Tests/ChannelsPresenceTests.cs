@@ -196,4 +196,28 @@ public class ChannelsPresenceTests(PostgresFixture pg)
         Assert.Equal("ann", (string?)after["members"]![0]!["uid"]);
         Assert.Equal("ghost:dropped", (string?)(await watcher.RequestAsync(new() { ["type"] = "read", ["path"] = "sessions/s1" }))["result"]!["items"]![0]!["key"]);
     }
+
+    [Fact]
+    public async Task A_drop_whose_clean_up_fails_is_cleaned_up_at_the_next_check_in()
+    {
+        await using var one = await StartAsync(configure: o => o.PresenceBeatEvery = TimeSpan.FromHours(1));   // check-ins by hand here
+        var presence = one.Services.GetRequiredService<RealtimePresence>();
+        await using var ann = await ConnectAsync(one, "ann");
+        await ann.RequestAsync(new()
+        {
+            ["type"] = "join", ["path"] = "sessions/s1",
+            ["onDisconnect"] = new JsonObject { ["key"] = "ann:left", ["payload"] = B64("left") },
+        });
+        presence.CleanupFault = 1;   // the database refuses the next clean-up
+        await ann.AbortAsync();
+        for (var i = 0; i < 50 && presence.CleanupFault > 0; i++) await Task.Delay(50);
+        Assert.Single(await presence.MembersAsync("sessions/s1"));   // still there: a ghost for now
+
+        await presence.BeatAsync(default);   // the next check-in
+        Assert.Empty(await presence.MembersAsync("sessions/s1"));
+        var items = (await one.Services.GetRequiredService<RealtimeStore>().ReadAsync("sessions/s1", 0, 10)).Items;
+        Assert.Equal(["ann:left"], items.Select(x => x.Key));
+        await presence.BeatAsync(default);
+        Assert.Single((await one.Services.GetRequiredService<RealtimeStore>().ReadAsync("sessions/s1", 0, 10)).Items);   // once
+    }
 }

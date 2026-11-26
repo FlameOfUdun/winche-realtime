@@ -124,7 +124,7 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
             lock (_subscriptions) { foreach (var s in _subscriptions.Values) s.Dispose(); _subscriptions.Clear(); }
             // Gone without leaving: out of every presence set, its on-disconnect items appended.
             try { await presence.DisconnectedAsync(_id, CancellationToken.None); }
-            catch (Exception e) { log.LogWarning(e, "Realtime couldn't end connection {Connection}'s presence: the sweep will.", _id); }
+            catch (Exception e) { log.LogWarning(e, "Realtime couldn't end connection {Connection}'s presence: trying again at the next check-in.", _id); }
             _out.Writer.TryComplete();
             try { await writing; } catch { /* gone */ }
             if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)

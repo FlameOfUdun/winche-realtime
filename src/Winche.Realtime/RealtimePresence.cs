@@ -68,8 +68,33 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
         if (await cmd.ExecuteNonQueryAsync(ct) > 0) await AnnounceAsync(path, ct);
     }
 
-    /// <summary>The connection ended: it leaves everywhere, and its on-disconnect items are appended.</summary>
+    /// <summary>
+    /// The connection ended: it leaves everywhere, and its on-disconnect items are appended. If that fails (the database
+    /// away a moment), this server tries again at each check-in until it's done: its members don't linger as ghosts
+    /// (and if the server stops first, the sweep clears them as a dead server's).
+    /// </summary>
     public async Task DisconnectedAsync(string connection, CancellationToken ct = default)
+    {
+        try
+        {
+            if (CleanupFault > 0 && Interlocked.Decrement(ref CleanupFault) >= 0) throw new InvalidOperationException("The database refused the clean-up (a test's fault).");
+            await CleanUpAsync(connection, ct);
+            _unfinished.TryRemove(connection, out _);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            _unfinished[connection] = 0;
+            throw;
+        }
+    }
+
+    /// <summary>For tests: how many clean-ups to refuse, as a database error would.</summary>
+    internal int CleanupFault;
+
+    /// <summary>Ended connections whose clean-up failed: tried again at each check-in.</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _unfinished = new(StringComparer.Ordinal);
+
+    private async Task CleanUpAsync(string connection, CancellationToken ct)
     {
         await using var cmd = Store.DataSource.CreateCommand($"""
             SELECT connection_id, path, uid, on_disconnect_key, on_disconnect_payload FROM {Members} WHERE connection_id = $1
@@ -102,10 +127,25 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
     internal async Task BeatAsync(CancellationToken ct)
     {
         await Store.EnsureAsync(ct);
-        await using var cmd = Store.DataSource.CreateCommand($"INSERT INTO {Servers} (id, seen_at) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET seen_at = EXCLUDED.seen_at");
-        cmd.Parameters.Add(new() { Value = node.Id });
-        cmd.Parameters.Add(new() { Value = options.Time.GetUtcNow() });
-        await cmd.ExecuteNonQueryAsync(ct);
+        await using (var cmd = Store.DataSource.CreateCommand($"INSERT INTO {Servers} (id, seen_at) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET seen_at = EXCLUDED.seen_at"))
+        {
+            cmd.Parameters.Add(new() { Value = node.Id });
+            cmd.Parameters.Add(new() { Value = options.Time.GetUtcNow() });
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        // Connections whose clean-up failed: again now (their on-disconnect items are keyed: never appended twice).
+        foreach (var connection in _unfinished.Keys)
+        {
+            try
+            {
+                await CleanUpAsync(connection, ct);
+                _unfinished.TryRemove(connection, out _);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                _log.LogWarning(e, "Realtime still couldn't end connection {Connection}'s presence: trying again at the next check-in.", connection);
+            }
+        }
     }
 
     /// <summary>Servers that stopped checking in before <paramref name="before"/>: their members are gone (on-disconnect run). How many.</summary>
