@@ -213,6 +213,11 @@ public class ChannelsPresenceTests(PostgresFixture pg)
         for (var i = 0; i < 300 && presence.UnfinishedCount == 0; i++) await Task.Delay(50);   // its clean-up failed and waits
         Assert.Equal(1, presence.UnfinishedCount);
         Assert.Single(await presence.MembersAsync("sessions/s1"));   // still there: a ghost for now
+        // Someone joining meanwhile doesn't do the retry (that's the check-in's): their join stays quick.
+        await using var bob = await ConnectAsync(one, "bob");
+        await bob.RequestAsync(new() { ["type"] = "join", ["path"] = "sessions/s2" });
+        Assert.Single(await presence.MembersAsync("sessions/s1"));
+        Assert.Equal(1, presence.UnfinishedCount);
 
         await presence.BeatAsync(default);   // the next check-in
         Assert.Empty(await presence.MembersAsync("sessions/s1"));

@@ -114,7 +114,7 @@ public sealed class RealtimeLists(RealtimeStore store, RuleEngine rules, Realtim
     internal async Task AnnounceClosedAsync(RealtimeListInfo list, CancellationToken ct)
     {
         if (changes is not null) await changes.ClosedAsync(list, ct);
-        await Store.AnnouncedAsync(list.Path, ct);
+        await Store.AnnouncedAsync(list, ct);
     }
 
     /// <summary>Whether the caller may append <paramref name="items"/> to <paramref name="path"/>: refused if not (nothing appended).</summary>

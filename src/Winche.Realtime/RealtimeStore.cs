@@ -65,6 +65,8 @@ public sealed class RealtimeStore : IAsyncDisposable
         $"ALTER TABLE {Lists} ADD COLUMN IF NOT EXISTS archive_failed_at timestamptz;",
         // A list closed whose "closed" event isn't out yet: set as it closes, cleared once published (the sweep resends).
         $"ALTER TABLE {Lists} ADD COLUMN IF NOT EXISTS closed_unannounced boolean NOT NULL DEFAULT false;",
+        // The sweep's once-a-minute look for events not yet out: only the lists still waiting, by when they closed.
+        $"CREATE INDEX IF NOT EXISTS idx_{Lists}_unannounced ON {Lists} (closed_at) WHERE closed_unannounced;",
     ];
 
     private readonly WincheRealtimeOptions _options;
@@ -343,11 +345,15 @@ public sealed class RealtimeStore : IAsyncDisposable
         return due;
     }
 
-    /// <summary>The list's "closed" event is out (or nothing listens for it).</summary>
-    internal async Task AnnouncedAsync(string path, CancellationToken ct)
+    /// <summary>
+    /// That close of the list has its "closed" event out (or nothing listens for it). Only that close: a list made and
+    /// closed again at the path meanwhile keeps its own mark.
+    /// </summary>
+    internal async Task AnnouncedAsync(RealtimeListInfo list, CancellationToken ct)
     {
-        await using var cmd = _db.CreateCommand($"UPDATE {Lists} SET closed_unannounced = false WHERE path = $1");
-        cmd.Parameters.Add(new() { Value = path });
+        await using var cmd = _db.CreateCommand($"UPDATE {Lists} SET closed_unannounced = false WHERE path = $1 AND closed_at = $2");
+        cmd.Parameters.Add(new() { Value = list.Path });
+        cmd.Parameters.Add(new() { Value = (object?)list.ClosedAt ?? DBNull.Value, NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.TimestampTz });
         await cmd.ExecuteNonQueryAsync(ct);
     }
 

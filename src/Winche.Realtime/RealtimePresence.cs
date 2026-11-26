@@ -40,7 +40,7 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
             Store.CheckItems([onDisconnect]);   // a key and size an append takes: refused now, not lost at the drop
             await lists.CanAppendAsync(caller, path, [onDisconnect], ct);
         }
-        await BeatAsync(ct);
+        await CheckInAsync(ct);   // only the check-in: the regular one retries unfinished clean-ups, so joins stay quick
         await using var cmd = Store.DataSource.CreateCommand($"""
             INSERT INTO {Members} (connection_id, path, uid, data, on_disconnect_key, on_disconnect_payload, server_id, joined_at)
             VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8)
@@ -91,6 +91,16 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
     /// <summary>For tests: how many clean-ups to refuse, as a database error would.</summary>
     internal int CleanupFault;
 
+    /// <summary>This server's check-in alone (its members stay while it does).</summary>
+    private async Task CheckInAsync(CancellationToken ct)
+    {
+        await Store.EnsureAsync(ct);
+        await using var cmd = Store.DataSource.CreateCommand($"INSERT INTO {Servers} (id, seen_at) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET seen_at = EXCLUDED.seen_at");
+        cmd.Parameters.Add(new() { Value = node.Id });
+        cmd.Parameters.Add(new() { Value = options.Time.GetUtcNow() });
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     /// <summary>For tests: how many ended connections wait to be cleaned up.</summary>
     internal int UnfinishedCount => _unfinished.Count;
 
@@ -129,13 +139,7 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
     /// <summary>This server checks in: its members stay while it does.</summary>
     internal async Task BeatAsync(CancellationToken ct)
     {
-        await Store.EnsureAsync(ct);
-        await using (var cmd = Store.DataSource.CreateCommand($"INSERT INTO {Servers} (id, seen_at) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET seen_at = EXCLUDED.seen_at"))
-        {
-            cmd.Parameters.Add(new() { Value = node.Id });
-            cmd.Parameters.Add(new() { Value = options.Time.GetUtcNow() });
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
+        await CheckInAsync(ct);
         // Connections whose clean-up failed: again now (their on-disconnect items are keyed: never appended twice).
         foreach (var connection in _unfinished.Keys)
         {

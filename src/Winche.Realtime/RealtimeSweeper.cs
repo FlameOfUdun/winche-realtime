@@ -77,7 +77,7 @@ public sealed class RealtimeSweeper(RealtimeStore store, WincheRealtimeOptions o
         try
         {
             if (changes is not null) await changes.ClosedAsync(list, ct);
-            await store.AnnouncedAsync(list.Path, ct);
+            await store.AnnouncedAsync(list, ct);
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {

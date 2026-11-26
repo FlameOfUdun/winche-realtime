@@ -97,4 +97,34 @@ public class ChangesTests(PostgresFixture pg)
         await sweeper.RunOnceAsync();
         Assert.Single(sink.Changes, c => c.Path == "sessions/s2");
     }
+
+    [Fact]
+    public async Task Marking_a_closed_event_sent_touches_only_that_close_of_the_path()
+    {
+        var options = new WincheRealtimeOptions { ConnectionString = await pg.NewDatabaseAsync() };
+        var store = new RealtimeStore(options);
+        await store.EnsureAsync();
+        await store.AppendAsync("sessions/s1", [new("a:1", Encoding.UTF8.GetBytes("x"))], null);
+        var first = await store.CloseAsync("sessions/s1");
+        Assert.True(await store.DeleteClosedAsync("sessions/s1"));
+        await Task.Delay(5);
+        await store.AppendAsync("sessions/s1", [new("a:1", Encoding.UTF8.GetBytes("y"))], null);
+        var second = await store.CloseAsync("sessions/s1");   // the same path, made and closed again
+
+        await store.AnnouncedAsync(first, default);           // the first close's publishing finishes late
+        var waiting = await store.UnannouncedAsync(DateTimeOffset.UtcNow.AddMinutes(1), 10, default);
+        Assert.Equal(second.ClosedAt, Assert.Single(waiting).ClosedAt);   // the second's event still goes out
+    }
+
+    [Fact]
+    public async Task The_resend_check_has_an_index_of_its_own()
+    {
+        var connection = await pg.NewDatabaseAsync();
+        var store = new RealtimeStore(new WincheRealtimeOptions { ConnectionString = connection });
+        await store.EnsureAsync();
+        await using var conn = new Npgsql.NpgsqlConnection(connection);
+        await conn.OpenAsync();
+        await using var cmd = new Npgsql.NpgsqlCommand("SELECT indexdef FROM pg_indexes WHERE indexdef ILIKE '%closed_unannounced%'", conn);
+        Assert.Contains("closed_at", (string?)await cmd.ExecuteScalarAsync() ?? "");
+    }
 }
