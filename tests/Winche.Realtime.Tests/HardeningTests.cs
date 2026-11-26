@@ -153,6 +153,19 @@ public class HardeningTests(PostgresFixture pg)
         Assert.Equal(WebSocketCloseStatus.MessageTooBig, socket.ClosedWith);
     }
 
+
+    [Fact]
+    public async Task A_join_that_was_saved_but_not_announced_still_counts_towards_the_limit()
+    {
+        await using var app = await StartAsync(s => s.MaxJoins = 1);
+        await using var ann = await ConnectAsync(app, "ann");
+        var presence = app.Services.GetRequiredService<RealtimePresence>();
+        presence.AnnounceFault = 1;   // the join is saved; telling the watchers fails
+        Assert.NotEqual("response", (string?)(await ann.RequestAsync(new JsonObject { ["type"] = "join", ["path"] = "sessions/s1" }))["type"]);
+        Assert.Single(await presence.MembersAsync("sessions/s1"));   // saved all the same
+        Assert.Equal("resource-exhausted", (string?)(await ann.RequestAsync(new JsonObject { ["type"] = "join", ["path"] = "sessions/s2" }))["error"]!["code"]);
+    }
+
     private sealed class ChangesSink : IWincheChangeSink
     {
         public readonly List<WincheChange> Changes = [];

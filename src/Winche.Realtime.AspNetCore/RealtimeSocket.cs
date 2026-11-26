@@ -332,11 +332,21 @@ internal sealed class RealtimeConnection(WebSocket socket, IReadOnlyDictionary<s
             if (key.Length == 0) throw new RealtimeException(WincheErrorCode.InvalidArgument, "onDisconnect needs a key and a payload (base64).");
         }
         var path = Path(frame);
+        // Counted before it's saved: a join that fails after its row is written (telling the watchers) still counts, so
+        // the limit holds (a failed one keeps its place until a leave or the connection ends).
+        bool counted;
         lock (_joined)
+        {
             if (!_joined.Contains(path) && _joined.Count >= options.MaxJoins)
                 throw new RealtimeException(WincheErrorCode.ResourceExhausted, $"A connection is present at {options.MaxJoins} paths at most.");
-        await presence.JoinAsync(caller, _id, path, frame["data"] as JsonObject, onDisconnect, ct);
-        lock (_joined) _joined.Add(path);
+            counted = _joined.Add(path);
+        }
+        try { await presence.JoinAsync(caller, _id, path, frame["data"] as JsonObject, onDisconnect, ct); }
+        catch (RealtimeException) when (counted)
+        {
+            lock (_joined) _joined.Remove(path);   // refused before anything was saved (rules, limits): no place taken
+            throw;
+        }
         return new JsonObject();
     }
 

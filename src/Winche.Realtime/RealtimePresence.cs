@@ -235,8 +235,12 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
     }
 
     /// <summary>Presence at <paramref name="path"/> changed: watchers here at once, other servers through Postgres.</summary>
+    /// <summary>For tests: how many announcements to refuse, as a database error would.</summary>
+    internal int AnnounceFault;
+
     private async Task AnnounceAsync(string path, CancellationToken ct)
     {
+        if (AnnounceFault > 0 && Interlocked.Decrement(ref AnnounceFault) >= 0) throw new InvalidOperationException("Telling the watchers failed (a test's fault).");
         lists.Notifier.Changed(Key(path), 0);
         await using var cmd = Store.DataSource.CreateCommand("SELECT pg_notify($1, $2)");
         cmd.Parameters.Add(new() { Value = RealtimeStore.Channel });
