@@ -234,10 +234,10 @@ public sealed class RealtimePresence(RealtimeLists lists, RealtimeNode node, Win
         return gone.Count;
     }
 
-    /// <summary>Presence at <paramref name="path"/> changed: watchers here at once, other servers through Postgres.</summary>
     /// <summary>For tests: how many announcements to refuse, as a database error would.</summary>
     internal int AnnounceFault;
 
+    /// <summary>Presence at <paramref name="path"/> changed: watchers here at once, other servers through Postgres.</summary>
     private async Task AnnounceAsync(string path, CancellationToken ct)
     {
         if (AnnounceFault > 0 && Interlocked.Decrement(ref AnnounceFault) >= 0) throw new InvalidOperationException("Telling the watchers failed (a test's fault).");
